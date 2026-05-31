@@ -18,5 +18,30 @@
   "claude_paths": [
     "~/.claude"
   ],
+  "custom_sources": [
+    {
+      "name": "qclaw",
+      "label": "腾讯 QClaw",
+      "format": "jsonl",
+      "paths": ["~/qclaw-token-usage.jsonl"],
+      "mapping": {
+        "timestamp": ["timestamp", "created_at", "time"],
+        "input_tokens": ["input_tokens", "usage.input_tokens"],
+        "cached_input_tokens": ["cached_input_tokens", "usage.cached_input_tokens"],
+        "output_tokens": ["output_tokens", "usage.output_tokens"],
+        "reasoning_output_tokens": ["reasoning_output_tokens", "usage.reasoning_output_tokens"],
+        "total_tokens": ["total_tokens", "usage.total_tokens"],
+        "session_id": ["session_id", "conversation_id"],
+        "model": ["model", "model_id"],
+        "cwd": ["cwd", "project_path"]
+      }
+    },
+    {
+      "name": "openclaw",
+      "label": "OpenClaw",
+      "format": "jsonl",
+      "paths": ["~/openclaw-token-usage.jsonl"]
+    }
+  ],
   "price_config": "prices.example.json"
 }

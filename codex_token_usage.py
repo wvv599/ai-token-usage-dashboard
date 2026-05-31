@@ -432,6 +432,24 @@ def first_string(*values: Any) -> str:
     return ""
 
 
+def get_nested(value: Any, path: str) -> Any:
+    current = value
+    for part in path.split("."):
+        if isinstance(current, dict):
+            current = current.get(part)
+        else:
+            return None
+    return current
+
+
+def first_nested(item: dict[str, Any], paths: Iterable[str]) -> Any:
+    for path in paths:
+        value = get_nested(item, path)
+        if value not in (None, ""):
+            return value
+    return None
+
+
 def claude_usage_map(value: Any) -> dict[str, int]:
     if not isinstance(value, dict):
         return {field: 0 for field in TOKEN_FIELDS}
@@ -1455,6 +1473,129 @@ def load_skill_events(
     return sorted(events, key=lambda event: event.timestamp)
 
 
+def custom_source_configs(settings: dict[str, Any]) -> list[dict[str, Any]]:
+    value = settings.get("custom_sources") or []
+    if not isinstance(value, list):
+        raise SystemExit("settings field 'custom_sources' must be an array")
+    output: list[dict[str, Any]] = []
+    for index, item in enumerate(value, 1):
+        if not isinstance(item, dict):
+            raise SystemExit(f"custom_sources[{index}] must be an object")
+        name = str(item.get("name") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+            raise SystemExit(f"custom_sources[{index}].name must use letters, numbers, dot, underscore, or dash")
+        paths = item.get("paths", item.get("path"))
+        if isinstance(paths, str):
+            parsed_paths = [user_path(paths)]
+        elif isinstance(paths, list) and all(isinstance(path, str) for path in paths):
+            parsed_paths = [user_path(path) for path in paths]
+        else:
+            raise SystemExit(f"custom_sources[{index}].paths must be a string or an array of strings")
+        fmt = str(item.get("format") or "jsonl").lower()
+        if fmt != "jsonl":
+            raise SystemExit(f"custom_sources[{index}].format currently supports only 'jsonl'")
+        output.append({**item, "name": name, "paths": parsed_paths, "format": fmt})
+    return output
+
+
+def custom_source_key(name: str) -> str:
+    return f"custom:{name}"
+
+
+def custom_source_label(config: dict[str, Any]) -> str:
+    return str(config.get("label") or config["name"])
+
+
+def custom_mapping_paths(mapping: dict[str, Any], key: str, defaults: list[str]) -> list[str]:
+    value = mapping.get(key)
+    if value is None:
+        return defaults
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return value
+    raise SystemExit(f"custom source mapping field {key!r} must be a string or an array of strings")
+
+
+def custom_event_from_item(
+    item: dict[str, Any], config: dict[str, Any], source_path: Path, local_tz: ZoneInfo, line_number: int
+) -> UsageEvent | None:
+    mapping = config.get("mapping") or {}
+    if not isinstance(mapping, dict):
+        raise SystemExit(f"custom source {config['name']!r} mapping must be an object")
+
+    timestamp_raw = first_nested(item, custom_mapping_paths(mapping, "timestamp", ["timestamp", "time", "created_at", "createdAt", "date"]))
+    if timestamp_raw is None:
+        return None
+    try:
+        if isinstance(timestamp_raw, (int, float)):
+            timestamp = parse_epoch_millis(timestamp_raw, local_tz) if timestamp_raw > 10_000_000_000 else parse_epoch_seconds(timestamp_raw, local_tz)
+        else:
+            timestamp = parse_timestamp(str(timestamp_raw), local_tz)
+    except Exception:
+        print(f"warning: invalid timestamp in custom source {source_path}:{line_number}", file=sys.stderr)
+        return None
+
+    def mapped_int(key: str, defaults: list[str]) -> int:
+        return safe_int(first_nested(item, custom_mapping_paths(mapping, key, defaults)))
+
+    input_tokens = mapped_int("input_tokens", ["input_tokens", "input", "usage.input_tokens", "tokens.input"])
+    cached_input_tokens = mapped_int("cached_input_tokens", ["cached_input_tokens", "cache_tokens", "usage.cached_input_tokens", "tokens.cache", "tokens.cache.read"])
+    output_tokens = mapped_int("output_tokens", ["output_tokens", "output", "usage.output_tokens", "tokens.output"])
+    reasoning_output_tokens = mapped_int("reasoning_output_tokens", ["reasoning_output_tokens", "reasoning_tokens", "usage.reasoning_output_tokens", "tokens.reasoning"])
+    total_tokens = mapped_int("total_tokens", ["total_tokens", "total", "usage.total_tokens", "tokens.total"])
+    if total_tokens == 0:
+        total_tokens = input_tokens + cached_input_tokens + output_tokens + reasoning_output_tokens
+    if total_tokens == 0:
+        return None
+
+    name = str(config["name"])
+    session_id = first_nested(item, custom_mapping_paths(mapping, "session_id", ["session_id", "sessionId", "conversation_id", "id"]))
+    model = first_nested(item, custom_mapping_paths(mapping, "model", ["model", "model_id", "modelID", "provider_model"]))
+    cwd = first_nested(item, custom_mapping_paths(mapping, "cwd", ["cwd", "project", "project_path", "path.cwd"]))
+    api_requests = mapped_int("api_requests", ["api_requests", "requests", "calls"])
+    return UsageEvent(
+        timestamp=timestamp,
+        date=timestamp.date().isoformat(),
+        tool=name,
+        session_id=str(session_id or f"{name}:{source_path.name}:{line_number}"),
+        model=str(model or "unknown"),
+        cwd=str(cwd or ""),
+        source=str(source_path),
+        input_tokens=input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        output_tokens=output_tokens,
+        reasoning_output_tokens=reasoning_output_tokens,
+        total_tokens=total_tokens,
+        api_requests=api_requests or 1,
+    )
+
+
+def load_custom_source_events(config: dict[str, Any], local_tz: ZoneInfo) -> list[UsageEvent]:
+    events: list[UsageEvent] = []
+    for log in discover_logs(config["paths"]):
+        try:
+            lines = log.open("r", encoding="utf-8", errors="replace")
+        except OSError as exc:
+            print(f"warning: cannot read custom source {log}: {exc}", file=sys.stderr)
+            continue
+        with lines:
+            for line_number, line in enumerate(lines, 1):
+                if not line.strip():
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    print(f"warning: invalid JSON in custom source {log}:{line_number}: {exc}", file=sys.stderr)
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                event = custom_event_from_item(item, config, log, local_tz, line_number)
+                if event:
+                    events.append(event)
+    return sorted(events, key=lambda event: event.timestamp)
+
+
 def filter_skill_events(
     events: list[SkillInvocationEvent], days: int | None, since: str | None, until: str | None
 ) -> list[SkillInvocationEvent]:
@@ -1504,6 +1645,7 @@ def load_events(
     claude_paths: list[Path],
     hermes_paths: list[Path],
     local_tz: ZoneInfo,
+    custom_sources: list[dict[str, Any]] | None = None,
 ) -> list[UsageEvent]:
     events: list[UsageEvent] = []
     if source in ("codex", "all"):
@@ -1514,6 +1656,10 @@ def load_events(
         events.extend(load_claude_events(claude_paths, local_tz))
     if source in ("hermes", "all"):
         events.extend(load_hermes_events(hermes_paths, local_tz))
+    for config in custom_sources or []:
+        key = custom_source_key(config["name"])
+        if source in ("all", "custom", key, config["name"]):
+            events.extend(load_custom_source_events(config, local_tz))
     return sorted(events, key=lambda event: event.timestamp)
 
 
@@ -1674,6 +1820,7 @@ def output_doctor(
     claude_paths: list[Path],
     hermes_paths: list[Path],
     price_config: Path | None,
+    custom_sources: list[dict[str, Any]] | None = None,
 ) -> None:
     print("AI Token Usage doctor")
     print(f"Version: {__version__}")
@@ -1693,6 +1840,14 @@ def output_doctor(
     print_path_status("OpenCode", opencode_paths, opencode_dbs, len(load_opencode_events(opencode_paths, local_tz)) if opencode_dbs else 0)
     print_path_status("Claude Code", claude_paths, claude_logs, len(load_claude_events(claude_paths, local_tz)) if claude_logs else 0)
     print_path_status("Hermes", hermes_paths, hermes_dbs, len(load_hermes_events(hermes_paths, local_tz)) if hermes_dbs else 0)
+    for config in custom_sources or []:
+        logs = discover_logs(config["paths"])
+        print_path_status(
+            f"Custom: {custom_source_label(config)} ({custom_source_key(config['name'])})",
+            config["paths"],
+            logs,
+            len(load_custom_source_events(config, local_tz)) if logs else 0,
+        )
 
     if not any((codex_logs, opencode_dbs, claude_logs, hermes_dbs)):
         print("\nNo data sources were found. Create ai-token-usage.json or pass --*-path flags to point to your app data.")
@@ -1942,6 +2097,7 @@ def summary_payload(
     source: str = "codex",
     tool_events: list[ToolCallEvent] | None = None,
     skill_events: list[SkillInvocationEvent] | None = None,
+    custom_sources: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     tool_events = tool_events or []
     skill_events = skill_events or []
@@ -1949,6 +2105,18 @@ def summary_payload(
     return {
         "source": source,
         "sources": sorted({event.tool for event in events}),
+        "available_sources": [
+            {"key": "codex", "label": "Codex"},
+            {"key": "opencode", "label": "OpenCode"},
+            {"key": "claude", "label": "Claude Code"},
+            {"key": "hermes", "label": "Hermes"},
+            *[
+                {"key": custom_source_key(config["name"]), "label": custom_source_label(config)}
+                for config in custom_sources or []
+            ],
+            *([{"key": "custom", "label": "自定义"}] if custom_sources else []),
+            {"key": "all", "label": "全部"},
+        ],
         "totals": totals(events, prices),
         "by_day": rollup(events, ("date",), prices),
         "by_hour": rollup(events, ("hour",), prices),
@@ -1975,8 +2143,9 @@ def output_json(
     source: str,
     tool_events: list[ToolCallEvent] | None = None,
     skill_events: list[SkillInvocationEvent] | None = None,
+    custom_sources: list[dict[str, Any]] | None = None,
 ) -> None:
-    payload = summary_payload(events, prices, source, tool_events, skill_events)
+    payload = summary_payload(events, prices, source, tool_events, skill_events, custom_sources)
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
@@ -2358,6 +2527,7 @@ HTML_PAGE = r"""<!doctype html>
     let untilDate = null;
     let draftStart = null;
     let visibleMonth = null;
+    let sourceLabels = { codex: 'Codex', opencode: 'OpenCode', claude: 'Claude Code', hermes: 'Hermes', custom: '自定义', all: '全部' };
 
     function rowCells(row, columns) {
       return columns.map(([key, label, cls]) => `<td class="${cls || ''}" title="${escapeHtml(String(row[key] ?? ''))}">${escapeHtml(formatValue(key, row[key]))}</td>`).join('');
@@ -2494,7 +2664,24 @@ HTML_PAGE = r"""<!doctype html>
     }
 
     function sourceLabel(source) {
-      return { codex: 'Codex', opencode: 'OpenCode', claude: 'Claude Code', hermes: 'Hermes', all: '全部' }[source] || source;
+      return sourceLabels[source] || source;
+    }
+
+    function renderSourceTabs(sources) {
+      if (!Array.isArray(sources) || sources.length === 0) return;
+      const tabs = document.getElementById('source-tabs');
+      const existing = Array.from(tabs.querySelectorAll('button')).map(button => button.dataset.source).join('|');
+      const next = sources.map(source => source.key).join('|');
+      sources.forEach(source => { sourceLabels[source.key] = source.label; });
+      if (existing === next) return;
+      tabs.innerHTML = sources.map(source => `<button class="tab ${source.key === activeSource ? 'active' : ''}" data-source="${escapeHtml(source.key)}">${escapeHtml(source.label)}</button>`).join('');
+      tabs.querySelectorAll('button').forEach(button => {
+        button.addEventListener('click', () => {
+          activeSource = button.dataset.source;
+          tabs.querySelectorAll('button').forEach(item => item.classList.toggle('active', item === button));
+          load();
+        });
+      });
     }
 
     function localISODate(date = new Date()) {
@@ -2621,6 +2808,7 @@ HTML_PAGE = r"""<!doctype html>
       const qs = `?${params.toString()}`;
       const res = await fetch(`/api/summary${qs}`, { cache: 'no-store' });
       const data = await res.json();
+      renderSourceTabs(data.available_sources);
       renderCards(data.totals, data.has_price_config);
       renderBars('daily', data.by_day, 'date');
       renderHourly(data.events || data.by_hour || []);
@@ -2670,13 +2858,13 @@ HTML_PAGE = r"""<!doctype html>
     document.addEventListener('click', event => {
       if (!document.getElementById('date-range').contains(event.target)) closeDatePicker();
     });
-    document.querySelectorAll('#source-tabs button').forEach(button => {
-      button.addEventListener('click', () => {
-        activeSource = button.dataset.source;
-        document.querySelectorAll('#source-tabs button').forEach(item => item.classList.toggle('active', item === button));
-        load();
-      });
-    });
+    renderSourceTabs([
+      { key: 'codex', label: 'Codex' },
+      { key: 'opencode', label: 'OpenCode' },
+      { key: 'claude', label: 'Claude Code' },
+      { key: 'hermes', label: 'Hermes' },
+      { key: 'all', label: '全部' },
+    ]);
     const today = localISODate();
     sinceDate = parseISODate(today);
     untilDate = parseISODate(today);
@@ -2703,7 +2891,13 @@ def serve_dashboard(
     default_until: str | None,
     default_source: str,
     prices: dict[str, dict[str, float]],
+    custom_sources: list[dict[str, Any]],
 ) -> None:
+    source_keys = {"codex", "opencode", "claude", "hermes", "custom", "all"}
+    for config in custom_sources:
+        source_keys.add(config["name"])
+        source_keys.add(custom_source_key(config["name"]))
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: Any) -> None:
             print(f"{self.address_string()} - {fmt % args}", file=sys.stderr)
@@ -2745,15 +2939,15 @@ def serve_dashboard(
                 since = query.get("since", [default_since or ""])[0] or default_since
                 until = query.get("until", [default_until or ""])[0] or default_until
                 source = query.get("source", [default_source])[0]
-                if source not in ("codex", "opencode", "claude", "hermes", "all"):
+                if source not in source_keys:
                     source = default_source
-                events = load_events(source, codex_paths, opencode_paths, claude_paths, hermes_paths, local_tz)
+                events = load_events(source, codex_paths, opencode_paths, claude_paths, hermes_paths, local_tz, custom_sources)
                 events = filter_events(events, days, since, until)
                 tool_events = load_tool_events(source, codex_paths, opencode_paths, claude_paths, hermes_paths, local_tz)
                 tool_events = filter_tool_events(tool_events, days, since, until)
                 skill_events = load_skill_events(source, claude_paths, hermes_paths, local_tz, (event.cwd for event in events))
                 skill_events = filter_skill_events(skill_events, days, since, until)
-                self.send_json(summary_payload(events, prices, source, tool_events, skill_events))
+                self.send_json(summary_payload(events, prices, source, tool_events, skill_events, custom_sources))
                 return
 
             self.send_response(404)
@@ -2808,9 +3002,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--source",
-        choices=("codex", "opencode", "claude", "hermes", "all"),
         default=None,
-        help="Usage source to show. Default: settings value or codex.",
+        help="Usage source to show: codex, opencode, claude, hermes, custom, all, or custom:<name>. Default: settings value or codex.",
     )
     parser.add_argument(
         "--days",
@@ -2866,9 +3059,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.days is not None and args.days < 1:
         parser.error("--days must be >= 1")
 
+    custom_sources = custom_source_configs(settings)
     source = args.source or str(settings.get("source") or "codex")
-    if source not in ("codex", "opencode", "claude", "hermes", "all"):
-        parser.error("settings field 'source' must be one of: codex, opencode, claude, hermes, all")
+    source_keys = {"codex", "opencode", "claude", "hermes", "custom", "all"}
+    for config in custom_sources:
+        source_keys.add(config["name"])
+        source_keys.add(custom_source_key(config["name"]))
+    if source not in source_keys:
+        parser.error("source must be one of: codex, opencode, claude, hermes, custom, all, or custom:<name> from custom_sources")
 
     timezone_name = args.timezone or str(settings.get("timezone") or "Asia/Shanghai")
     host = args.host or str(settings.get("host") or "127.0.0.1")
@@ -2899,6 +3097,7 @@ def main(argv: list[str] | None = None) -> int:
             claude_paths,
             hermes_paths,
             price_config,
+            custom_sources,
         )
         return 0
 
@@ -2916,10 +3115,11 @@ def main(argv: list[str] | None = None) -> int:
             args.until,
             source,
             prices,
+            custom_sources,
         )
         return 0
 
-    events = load_events(source, codex_paths, opencode_paths, claude_paths, hermes_paths, local_tz)
+    events = load_events(source, codex_paths, opencode_paths, claude_paths, hermes_paths, local_tz, custom_sources)
     events = filter_events(events, args.days, args.since, args.until)
     tool_events = load_tool_events(source, codex_paths, opencode_paths, claude_paths, hermes_paths, local_tz)
     tool_events = filter_tool_events(tool_events, args.days, args.since, args.until)
@@ -2927,7 +3127,7 @@ def main(argv: list[str] | None = None) -> int:
     skill_events = filter_skill_events(skill_events, args.days, args.since, args.until)
 
     if args.format == "json":
-        output_json(events, prices, source, tool_events, skill_events)
+        output_json(events, prices, source, tool_events, skill_events, custom_sources)
     elif args.format == "csv":
         output_csv(events)
     else:

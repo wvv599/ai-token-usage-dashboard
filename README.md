@@ -166,8 +166,64 @@ Supported settings fields:
 | `claude_paths` / `claude_path` | array/string | Claude Code root, projects directory, or JSONL file |
 | `hermes_paths` / `hermes_path` | array/string | Hermes home/profile directory or `state.db` file |
 | `price_config` | string | Optional price config JSON path |
+| `custom_sources` | array | User-defined JSONL token sources for apps that are not built in |
 
 CLI flags override settings file values.
+
+## Custom applications
+
+Apps such as Tencent QClaw, OpenClaw, or internal tools may not have a built-in parser yet. You can still add them by exporting or converting their usage data to JSONL and registering a `custom_sources` entry in `ai-token-usage.json`.
+
+Each line in the JSONL file should represent one usage event. The default field names are intentionally simple:
+
+```jsonl
+{"timestamp":"2026-05-31T13:00:00+08:00","session_id":"q1","model":"qclaw-model","cwd":"/repo/app","input_tokens":1200,"cached_input_tokens":300,"output_tokens":450,"reasoning_output_tokens":0,"total_tokens":1950}
+{"timestamp":"2026-05-31T14:00:00+08:00","session_id":"q2","model":"qclaw-model","cwd":"/repo/app","usage":{"input_tokens":2000,"output_tokens":800,"total_tokens":2800}}
+```
+
+Then add a custom source:
+
+```json
+{
+  "source": "all",
+  "custom_sources": [
+    {
+      "name": "qclaw",
+      "label": "腾讯 QClaw",
+      "format": "jsonl",
+      "paths": ["~/qclaw-token-usage.jsonl"],
+      "mapping": {
+        "timestamp": ["timestamp", "created_at", "time"],
+        "input_tokens": ["input_tokens", "usage.input_tokens"],
+        "cached_input_tokens": ["cached_input_tokens", "usage.cached_input_tokens"],
+        "output_tokens": ["output_tokens", "usage.output_tokens"],
+        "reasoning_output_tokens": ["reasoning_output_tokens", "usage.reasoning_output_tokens"],
+        "total_tokens": ["total_tokens", "usage.total_tokens"],
+        "session_id": ["session_id", "conversation_id"],
+        "model": ["model", "model_id"],
+        "cwd": ["cwd", "project_path"]
+      }
+    },
+    {
+      "name": "openclaw",
+      "label": "OpenClaw",
+      "format": "jsonl",
+      "paths": ["~/openclaw-token-usage.jsonl"]
+    }
+  ]
+}
+```
+
+After saving the config:
+
+```bash
+python3 codex_token_usage.py --doctor
+python3 codex_token_usage.py --serve --source all
+python3 codex_token_usage.py --source custom:qclaw
+python3 codex_token_usage.py --source custom
+```
+
+Dashboard source tabs are generated dynamically. Each custom source appears as its own tab, and `自定义` aggregates all custom apps. To remove an app, delete its object from `custom_sources` and refresh/restart the dashboard.
 
 ## Diagnostics
 

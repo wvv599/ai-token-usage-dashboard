@@ -141,6 +141,51 @@ class UsageLogicTests(unittest.TestCase):
             [Path("~/.hermes").expanduser(), Path("~/custom").expanduser()],
         )
 
+    def test_custom_jsonl_source_uses_mapping_and_dynamic_source_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "qclaw.jsonl"
+            log.write_text(
+                json.dumps(
+                    {
+                        "created_at": "2026-05-31T13:30:00Z",
+                        "conversation_id": "q1",
+                        "model_id": "qclaw-large",
+                        "project_path": "/repo/qclaw",
+                        "usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 30, "total_tokens": 150},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            settings = {
+                "custom_sources": [
+                    {
+                        "name": "qclaw",
+                        "label": "腾讯 QClaw",
+                        "paths": [str(log)],
+                        "mapping": {
+                            "timestamp": "created_at",
+                            "input_tokens": "usage.input_tokens",
+                            "cached_input_tokens": "usage.cached_input_tokens",
+                            "output_tokens": "usage.output_tokens",
+                            "total_tokens": "usage.total_tokens",
+                            "session_id": "conversation_id",
+                            "model": "model_id",
+                            "cwd": "project_path",
+                        },
+                    }
+                ]
+            }
+            custom_sources = usage.custom_source_configs(settings)
+            events = usage.load_events("custom:qclaw", [], [], [], [], UTC, custom_sources)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].tool, "qclaw")
+        self.assertEqual(events[0].hour, "2026-05-31 13:00")
+        self.assertEqual(events[0].total_tokens, 150)
+        self.assertEqual(events[0].cached_input_tokens, 20)
+        self.assertEqual(events[0].session_id, "q1")
+
 
 if __name__ == "__main__":
     unittest.main()
