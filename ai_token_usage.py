@@ -2465,15 +2465,15 @@ HTML_PAGE = r"""<!doctype html>
     <div class="wrap topbar">
       <div>
         <h1>AI Token 用量看板</h1>
-        <div class="sub" id="meta">默认展示当天数据，可自定义日期范围查看用量。</div>
+        <div class="sub" id="meta">默认展示全部应用当天数据，可自定义来源和日期范围查看用量。</div>
       </div>
       <div class="controls">
         <div class="tabs" id="source-tabs">
-          <button class="tab active" data-source="codex">Codex</button>
+          <button class="tab" data-source="codex">Codex</button>
           <button class="tab" data-source="opencode">OpenCode</button>
           <button class="tab" data-source="claude">Claude Code</button>
           <button class="tab" data-source="hermes">Hermes</button>
-          <button class="tab" data-source="all">全部</button>
+          <button class="tab active" data-source="all">全部</button>
         </div>
         <div class="date-range" id="date-range">
           <button class="date-trigger" id="date-trigger" type="button">今天</button>
@@ -2670,10 +2670,8 @@ HTML_PAGE = r"""<!doctype html>
     function renderSourceTabs(sources) {
       if (!Array.isArray(sources) || sources.length === 0) return;
       const tabs = document.getElementById('source-tabs');
-      const existing = Array.from(tabs.querySelectorAll('button')).map(button => button.dataset.source).join('|');
-      const next = sources.map(source => source.key).join('|');
       sources.forEach(source => { sourceLabels[source.key] = source.label; });
-      if (existing === next) return;
+      if (!sources.some(source => source.key === activeSource)) activeSource = sources.some(source => source.key === 'all') ? 'all' : sources[0].key;
       tabs.innerHTML = sources.map(source => `<button class="tab ${source.key === activeSource ? 'active' : ''}" data-source="${escapeHtml(source.key)}">${escapeHtml(source.label)}</button>`).join('');
       tabs.querySelectorAll('button').forEach(button => {
         button.addEventListener('click', () => {
@@ -3003,7 +3001,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--source",
         default=None,
-        help="Usage source to show: codex, opencode, claude, hermes, custom, all, or custom:<name>. Default: settings value or codex.",
+        help="Usage source to show: codex, opencode, claude, hermes, custom, all, or custom:<name>. Default: settings value or all.",
     )
     parser.add_argument(
         "--days",
@@ -3060,7 +3058,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--days must be >= 1")
 
     custom_sources = custom_source_configs(settings)
-    source = args.source or str(settings.get("source") or "codex")
+    source = args.source or str(settings.get("source") or "all")
     source_keys = {"codex", "opencode", "claude", "hermes", "custom", "all"}
     for config in custom_sources:
         source_keys.add(config["name"])

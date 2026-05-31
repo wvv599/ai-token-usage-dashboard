@@ -11,6 +11,10 @@ Run one Python file to inspect local usage logs, open a dashboard, export CSV/JS
 
 > Fully local dashboard: `python3 ai_token_usage.py --serve --source all`
 
+![AI Token Usage dashboard preview](assets/dashboard-preview.svg)
+
+<p align="center"><em>Privacy-safe preview with synthetic data. The real dashboard runs locally and does not send usage data anywhere.</em></p>
+
 ## What you get
 
 | Area | Details |
@@ -26,7 +30,7 @@ Run one Python file to inspect local usage logs, open a dashboard, export CSV/JS
 - **Local-first and private**: reads local usage files from supported tools and aggregates numeric usage fields only.
 - **No project-owned database**: this project does not ask users to create, migrate, or maintain any database. Custom apps use simple JSONL files.
 - **No required third-party dependencies**: Python 3.10+ standard library is enough.
-- **Multi-tool support**: Codex, OpenCode, Claude Code, Hermes, or all sources together.
+- **Multi-tool support**: Codex, OpenCode, Claude Code, Hermes, or all sources together. The dashboard starts on **All** sources and today's local date by default.
 - **Dashboard included**: cards, daily chart, hourly time-of-day chart, model/project/session tables, tool and skill tables.
 - **Cross-platform defaults**: detects common macOS, Linux, and Windows user data locations.
 - **Export friendly**: text, JSON, and CSV outputs.
@@ -66,7 +70,7 @@ ai-token-usage --serve --source all
 ## CLI usage
 
 ```bash
-# Terminal report, Codex by default
+# Terminal report, all sources by default
 python3 ai_token_usage.py
 
 # Select one source
