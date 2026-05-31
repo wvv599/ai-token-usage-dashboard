@@ -11,9 +11,9 @@ Run one Python file to inspect local usage logs, open a dashboard, export CSV/JS
 
 > Fully local dashboard: `python3 ai_token_usage.py --serve --source all`
 
-![AI Token Usage dashboard preview](assets/dashboard-preview.svg)
+![AI Token Usage dashboard preview](assets/dashboard-preview.png)
 
-<p align="center"><em>Privacy-safe preview with synthetic data. The real dashboard runs locally and does not send usage data anywhere.</em></p>
+<p align="center"><em>Real dashboard preview with privacy redaction. Text, paths, sessions, and exact numbers are intentionally obscured.</em></p>
 
 ## What you get
 
