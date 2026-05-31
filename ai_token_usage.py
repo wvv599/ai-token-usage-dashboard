@@ -2984,7 +2984,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         type=Path,
         default=None,
-        help="OpenCode data directory or opencode.db file. Defaults to common per-user locations for macOS/Linux/Windows.",
+        help="OpenCode data directory or existing local storage file. Defaults to common per-user locations for macOS/Linux/Windows.",
     )
     parser.add_argument(
         "--claude-path",
@@ -2998,7 +2998,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         type=Path,
         default=None,
-        help="Hermes home/profile directory or state.db file. Defaults to common per-user locations for macOS/Linux/Windows.",
+        help="Hermes home/profile directory or existing local storage file. Defaults to common per-user locations for macOS/Linux/Windows.",
     )
     parser.add_argument(
         "--source",

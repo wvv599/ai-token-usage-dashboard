@@ -22,14 +22,14 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/your-org/ai-token-usage"
-Issues = "https://github.com/your-org/ai-token-usage/issues"
+Homepage = "https://github.com/wvv599/ai-token-usage-dashboard"
+Issues = "https://github.com/wvv599/ai-token-usage-dashboard/issues"
 
 [project.scripts]
-ai-token-usage = "codex_token_usage:main"
+ai-token-usage = "ai_token_usage:main"
 
 [tool.setuptools]
-py-modules = ["codex_token_usage"]
+py-modules = ["ai_token_usage"]
 
 [tool.ruff]
 line-length = 120

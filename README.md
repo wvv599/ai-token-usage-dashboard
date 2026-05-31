@@ -1,14 +1,30 @@
 # AI Token Usage
 
-Privacy-preserving local token usage reports for **Codex**, **OpenCode**, **Claude Code**, and **Hermes**.
+[![CI](https://github.com/wvv599/ai-token-usage-dashboard/actions/workflows/ci.yml/badge.svg)](https://github.com/wvv599/ai-token-usage-dashboard/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![No required dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](pyproject.toml)
+
+Privacy-preserving local token usage reports for **Codex**, **OpenCode**, **Claude Code**, **Hermes**, and custom AI coding tools.
 
 Run one Python file to inspect local usage logs, open a dashboard, export CSV/JSON, compare tools, and find high-consumption time periods without sending your data anywhere.
 
-> Screenshot/GIF coming soon. The dashboard is fully local and can be opened with `python3 codex_token_usage.py --serve --source all`.
+> Fully local dashboard: `python3 ai_token_usage.py --serve --source all`
+
+## What you get
+
+| Area | Details |
+| --- | --- |
+| Sources | Codex, OpenCode, Claude Code, Hermes, plus configurable JSONL custom sources |
+| Dashboard | Daily/hourly token charts, source tabs, model/project/session breakdowns, tool and skill tables |
+| Exports | Terminal summary, JSON, and CSV |
+| Privacy | Reads local files only; dashboard binds to `127.0.0.1` by default |
+| Setup | Python 3.10+ standard library; no required packages and no project-owned database |
 
 ## Highlights
 
-- **Local-first and private**: reads local logs/databases and aggregates numeric usage fields only.
+- **Local-first and private**: reads local usage files from supported tools and aggregates numeric usage fields only.
+- **No project-owned database**: this project does not ask users to create, migrate, or maintain any database. Custom apps use simple JSONL files.
 - **No required third-party dependencies**: Python 3.10+ standard library is enough.
 - **Multi-tool support**: Codex, OpenCode, Claude Code, Hermes, or all sources together.
 - **Dashboard included**: cards, daily chart, hourly time-of-day chart, model/project/session tables, tool and skill tables.
@@ -18,8 +34,12 @@ Run one Python file to inspect local usage logs, open a dashboard, export CSV/JS
 
 ## Quick start
 
+Clone the repository and run the single Python file:
+
 ```bash
-python3 codex_token_usage.py --serve --source all
+git clone https://github.com/wvv599/ai-token-usage-dashboard.git
+cd ai-token-usage-dashboard
+python3 ai_token_usage.py --serve --source all
 ```
 
 Open:
@@ -29,6 +49,13 @@ http://127.0.0.1:8765
 ```
 
 The dashboard defaults to today's local date. Use the date-range picker to inspect any custom range.
+
+If you prefer a command entry point, install from the Git repository:
+
+```bash
+python3 -m pip install git+https://github.com/wvv599/ai-token-usage-dashboard.git
+ai-token-usage --serve --source all
+```
 
 ## Requirements
 
@@ -40,31 +67,31 @@ The dashboard defaults to today's local date. Use the date-range picker to inspe
 
 ```bash
 # Terminal report, Codex by default
-python3 codex_token_usage.py
+python3 ai_token_usage.py
 
 # Select one source
-python3 codex_token_usage.py --source opencode
-python3 codex_token_usage.py --source claude
-python3 codex_token_usage.py --source hermes
+python3 ai_token_usage.py --source opencode
+python3 ai_token_usage.py --source claude
+python3 ai_token_usage.py --source hermes
 
 # Combine all sources
-python3 codex_token_usage.py --source all
+python3 ai_token_usage.py --source all
 
 # Date filtering
-python3 codex_token_usage.py --days 7
-python3 codex_token_usage.py --since 2026-05-01 --until 2026-05-29
+python3 ai_token_usage.py --days 7
+python3 ai_token_usage.py --since 2026-05-01 --until 2026-05-29
 
 # Machine-readable output
-python3 codex_token_usage.py --format json
-python3 codex_token_usage.py --format csv > token-events.csv
+python3 ai_token_usage.py --format json
+python3 ai_token_usage.py --format csv > token-events.csv
 
 # Dashboard
-python3 codex_token_usage.py --serve
-python3 codex_token_usage.py --serve --source all
+python3 ai_token_usage.py --serve
+python3 ai_token_usage.py --serve --source all
 
 # Diagnostics
-python3 codex_token_usage.py --doctor
-python3 codex_token_usage.py --version
+python3 ai_token_usage.py --doctor
+python3 ai_token_usage.py --version
 ```
 
 ## Dashboard features
@@ -102,10 +129,10 @@ By default, the script checks common per-user locations across macOS, Linux, and
 Manual paths always take priority:
 
 ```bash
-python3 codex_token_usage.py --codex-path ~/.codex
-python3 codex_token_usage.py --opencode-path ~/.local/share/opencode/opencode.db
-python3 codex_token_usage.py --claude-path ~/.claude/projects
-python3 codex_token_usage.py --hermes-path ~/.hermes/state.db
+python3 ai_token_usage.py --codex-path ~/.codex
+python3 ai_token_usage.py --opencode-path ~/.local/share/opencode
+python3 ai_token_usage.py --claude-path ~/.claude/projects
+python3 ai_token_usage.py --hermes-path ~/.hermes
 ```
 
 ## Persistent settings
@@ -129,7 +156,7 @@ export AI_TOKEN_USAGE_CONFIG=/path/to/ai-token-usage.json
 Or pass a config file explicitly:
 
 ```bash
-python3 codex_token_usage.py --config /path/to/ai-token-usage.json --serve
+python3 ai_token_usage.py --config /path/to/ai-token-usage.json --serve
 ```
 
 Example:
@@ -142,7 +169,7 @@ Example:
   "port": 8765,
   "hermes_paths": [
     "~/.hermes",
-    "/Volumes/Data/Hermes/state.db"
+    "/Volumes/Data/Hermes"
   ],
   "opencode_paths": [
     "~/.local/share/opencode",
@@ -162,9 +189,9 @@ Supported settings fields:
 | `host` | string | Dashboard host |
 | `port` | number | Dashboard port |
 | `codex_paths` / `codex_path` | array/string | Codex log root or JSONL file |
-| `opencode_paths` / `opencode_path` | array/string | OpenCode data directory or `opencode.db` file |
+| `opencode_paths` / `opencode_path` | array/string | OpenCode data directory, or its existing local storage file if you know the exact file |
 | `claude_paths` / `claude_path` | array/string | Claude Code root, projects directory, or JSONL file |
-| `hermes_paths` / `hermes_path` | array/string | Hermes home/profile directory or `state.db` file |
+| `hermes_paths` / `hermes_path` | array/string | Hermes home/profile directory, or its existing local storage file if you know the exact file |
 | `price_config` | string | Optional price config JSON path |
 | `custom_sources` | array | User-defined JSONL token sources for apps that are not built in |
 
@@ -173,6 +200,8 @@ CLI flags override settings file values.
 ## Custom applications
 
 Apps such as Tencent QClaw, OpenClaw, or internal tools may not have a built-in parser yet. You can still add them by exporting or converting their usage data to JSONL and registering a `custom_sources` entry in `ai-token-usage.json`.
+
+Custom apps deliberately use JSONL instead of a database. To add an app, add a JSONL file path; to remove an app, delete its `custom_sources` entry. No migrations, services, or extra database files are required.
 
 Each line in the JSONL file should represent one usage event. The default field names are intentionally simple:
 
@@ -217,10 +246,10 @@ Then add a custom source:
 After saving the config:
 
 ```bash
-python3 codex_token_usage.py --doctor
-python3 codex_token_usage.py --serve --source all
-python3 codex_token_usage.py --source custom:qclaw
-python3 codex_token_usage.py --source custom
+python3 ai_token_usage.py --doctor
+python3 ai_token_usage.py --serve --source all
+python3 ai_token_usage.py --source custom:qclaw
+python3 ai_token_usage.py --source custom
 ```
 
 Dashboard source tabs are generated dynamically. Each custom source appears as its own tab, and `自定义` aggregates all custom apps. To remove an app, delete its object from `custom_sources` and refresh/restart the dashboard.
@@ -230,8 +259,8 @@ Dashboard source tabs are generated dynamically. Each custom source appears as i
 Use `--doctor` when a source shows no data or when you need to confirm which files are being scanned.
 
 ```bash
-python3 codex_token_usage.py --doctor
-python3 codex_token_usage.py --doctor --config /path/to/ai-token-usage.json
+python3 ai_token_usage.py --doctor
+python3 ai_token_usage.py --doctor --config /path/to/ai-token-usage.json
 ```
 
 It prints:
@@ -240,14 +269,14 @@ It prints:
 - active source and timezone
 - loaded settings file and settings keys
 - configured paths and whether they exist
-- discovered log/database files
+- discovered usage files from each source
 - usage event counts for each source
 - attribution notes, including the Hermes session-level limitation
 
 For release/debug scripts, use:
 
 ```bash
-python3 codex_token_usage.py --version
+python3 ai_token_usage.py --version
 ```
 
 ## Time zone
@@ -255,8 +284,8 @@ python3 codex_token_usage.py --version
 Daily and hourly grouping defaults to `Asia/Shanghai`.
 
 ```bash
-python3 codex_token_usage.py --timezone Asia/Shanghai
-python3 codex_token_usage.py --timezone UTC
+python3 ai_token_usage.py --timezone Asia/Shanghai
+python3 ai_token_usage.py --timezone UTC
 ```
 
 ## Optional cost estimates
@@ -283,8 +312,8 @@ Cost estimates are disabled by default. To enable them, provide a price config k
 Run with:
 
 ```bash
-python3 codex_token_usage.py --price-config prices.example.json
-python3 codex_token_usage.py --serve --source all --price-config prices.example.json
+python3 ai_token_usage.py --price-config prices.example.json
+python3 ai_token_usage.py --serve --source all --price-config prices.example.json
 ```
 
 ## Counting model
@@ -295,7 +324,7 @@ Codex logs write `token_count` events with cumulative `total_token_usage`. The s
 
 ### OpenCode
 
-OpenCode usage is read from assistant message token metadata in `opencode.db` using SQLite read-only mode. This keeps timestamps aligned with the actual request time, so hourly charts can show usage in the correct hour instead of attributing a whole session to its latest update time. `tokens.cache.read + tokens.cache.write` is reported as `cached_input_tokens`. Message content is not printed or stored.
+OpenCode usage is read from assistant message token metadata in OpenCode's existing local storage, opened read-only. This keeps timestamps aligned with the actual request time, so hourly charts can show usage in the correct hour instead of attributing a whole session to its latest update time. `tokens.cache.read + tokens.cache.write` is reported as `cached_input_tokens`. Message content is not printed or stored.
 
 ### Claude Code
 
@@ -303,7 +332,7 @@ Claude Code usage-bearing JSONL records are counted per usage-bearing record. `c
 
 ### Hermes
 
-Hermes session totals are read from `state.db` and profile databases. `cache_read_tokens + cache_write_tokens` is reported as `cached_input_tokens`. Tool and historical skill information is counted from tool metadata; message content is not printed or stored.
+Hermes session totals are read from Hermes' existing local storage and profile data, opened read-only. `cache_read_tokens + cache_write_tokens` is reported as `cached_input_tokens`. Tool and historical skill information is counted from tool metadata; message content is not printed or stored.
 
 Hermes currently exposes reliable input/output/cache/reasoning token totals at the session level, so usage is attributed to `ended_at` when available, otherwise `started_at`. This means Hermes hourly charts are session-time attributed rather than exact per-request attribution. Codex, OpenCode, and Claude Code use event/message/usage-record timestamps.
 
@@ -335,7 +364,7 @@ Dashboard/table rollups include:
 ## Privacy and security
 
 - The dashboard binds to `127.0.0.1` by default.
-- OpenCode and Hermes databases are opened in read-only mode.
+- OpenCode and Hermes existing local storage files are opened in read-only mode.
 - The script aggregates numeric usage fields and minimal metadata.
 - It does not intentionally print or store chat content.
 - JSON/CSV exports can include local paths and session IDs; review exports before sharing.
@@ -345,9 +374,9 @@ See [`SECURITY.md`](SECURITY.md) for reporting and privacy notes.
 ## Development
 
 ```bash
-python3 -m py_compile codex_token_usage.py
-python3 codex_token_usage.py --help
-python3 codex_token_usage.py --serve --source all
+python3 -m py_compile ai_token_usage.py
+python3 ai_token_usage.py --help
+python3 ai_token_usage.py --serve --source all
 ```
 
 Contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md).

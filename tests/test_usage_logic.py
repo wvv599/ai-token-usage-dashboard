@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import codex_token_usage as usage
+import ai_token_usage as usage
 
 
 UTC = ZoneInfo("UTC")

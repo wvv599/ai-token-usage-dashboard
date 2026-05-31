@@ -10,7 +10,7 @@
   ],
   "hermes_paths": [
     "~/.hermes",
-    "/path/to/custom/hermes/state.db"
+    "/path/to/custom/hermes"
   ],
   "codex_paths": [
     "~/.codex"

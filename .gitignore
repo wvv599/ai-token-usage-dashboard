@@ -23,7 +23,7 @@ htmlcov/
 *.sqlite3
 *.jsonl
 *.log
-codex-token-events.csv
+token-events.csv
 ai-token-usage.json
 
 # Tooling caches

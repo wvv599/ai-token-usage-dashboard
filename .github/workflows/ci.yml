@@ -24,10 +24,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Syntax check
-        run: python -m py_compile codex_token_usage.py
+        run: python -m py_compile ai_token_usage.py
 
       - name: CLI help
-        run: python codex_token_usage.py --help
+        run: python ai_token_usage.py --help
 
       - name: Unit tests
         run: python -m unittest discover -s tests
