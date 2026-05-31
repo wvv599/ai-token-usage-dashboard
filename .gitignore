@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Test / coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local runtime data
+*.db
+*.sqlite
+*.sqlite3
+*.jsonl
+*.log
+codex-token-events.csv
+ai-token-usage.json
+
+# Tooling caches
+.playwright-mcp/
+.opencode/
+.opencode/node_modules/
+opencode.json
+AGENTS.md
+codex-token-dashboard.png
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

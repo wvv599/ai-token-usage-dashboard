@@ -1,0 +1,22 @@
+{
+  "source": "all",
+  "timezone": "Asia/Shanghai",
+  "host": "127.0.0.1",
+  "port": 8765,
+  "opencode_paths": [
+    "~/.local/share/opencode",
+    "~/Library/Application Support/opencode",
+    "%LOCALAPPDATA%/opencode"
+  ],
+  "hermes_paths": [
+    "~/.hermes",
+    "/path/to/custom/hermes/state.db"
+  ],
+  "codex_paths": [
+    "~/.codex"
+  ],
+  "claude_paths": [
+    "~/.claude"
+  ],
+  "price_config": "prices.example.json"
+}

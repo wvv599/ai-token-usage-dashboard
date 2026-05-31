@@ -1,0 +1,38 @@
+name: Bug report
+description: Report a reproducible problem
+title: "bug: "
+labels: [bug]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Run ...
+        2. Open ...
+        3. See ...
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: macOS 14, Ubuntu 24.04, Windows 11
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: python3 --version
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Remove private paths, session IDs, and chat content before sharing.
+      render: text
