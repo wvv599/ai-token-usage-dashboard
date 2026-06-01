@@ -125,9 +125,9 @@ By default, the script checks common per-user locations across macOS, Linux, and
 
 | Tool | Common locations |
 | --- | --- |
-| Codex | `~/.codex`, plus common app-data directories named `codex` |
-| OpenCode | `$XDG_DATA_HOME/opencode`, `~/.local/share/opencode`, `~/Library/Application Support/opencode`, `%LOCALAPPDATA%\opencode`, `%APPDATA%\opencode` |
-| Claude Code | `~/.claude`, plus common app-data directories named `Claude` or `claude` |
+| Codex | `~/.codex`, including JSONL sessions and newer `state*.sqlite` stores, plus common app-data directories named `codex` or `Codex` |
+| OpenCode | `OPENCODE_DATA_DIR`, `$XDG_DATA_HOME/opencode`, `~/.local/share/opencode`, `~/.config/opencode`, `~/Library/Application Support/opencode`, `%LOCALAPPDATA%\opencode`, `%APPDATA%\opencode`, and common `OpenCode` variants |
+| Claude Code | `~/.claude`, `~/.claude.json`, plus common app-data directories named `Claude` or `claude` |
 | Hermes | `~/.hermes`, plus common app-data directories named `hermes` |
 
 Manual paths always take priority:
@@ -324,7 +324,7 @@ python3 ai_token_usage.py --serve --source all --price-config prices.example.jso
 
 ### Codex
 
-Codex logs write `token_count` events with cumulative `total_token_usage`. The script computes the delta from the previous cumulative value in the same session file. This avoids double-counting repeated cumulative events.
+Codex logs write `token_count` events with cumulative `total_token_usage`. The script computes the delta from the previous cumulative value in the same session file. This avoids double-counting repeated cumulative events. Newer Codex installations may also keep thread-level totals in `~/.codex/state*.sqlite`; when a JSONL session has no detailed token events, the script falls back to the SQLite `threads.tokens_used` total so Windows and current Codex CLI installations can still show real usage totals.
 
 ### OpenCode
 

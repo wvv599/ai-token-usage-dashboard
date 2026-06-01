@@ -10,7 +10,9 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -74,10 +76,28 @@ BUNDLED_SKILLS = {
 
 SKILL_COMMAND_RE = re.compile(r"^/(?P<name>[A-Za-z0-9_.:-][A-Za-z0-9_.:-]*)(?:\s|$)")
 HERMES_SKILL_PATH_RE = re.compile(r"(?:^|/)(?P<name>[A-Za-z0-9_.:-]+)/(?:SKILL\.md|skill\.md)")
+HERMES_TOOL_MESSAGE_TYPES = {
+    "tool_call",
+    "tool_result",
+    "tool_use",
+    "tool",
+    "function_call",
+    "function_result",
+}
+HERMES_TOOL_ID_KEYS = (
+    "tool_call_id",
+    "toolCallId",
+    "tool_use_id",
+    "toolUseId",
+    "call_id",
+    "callId",
+)
+HERMES_SKILL_METADATA_TOOLS = {"skill_view", "skill_manage", "skills_list"}
 
 SESSION_ID_RE = re.compile(
     r"rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(?P<id>[^/]+)\.jsonl$"
 )
+PATH_DATE_RE = re.compile(r"(?<!\d)(\d{4})[-\\/](\d{2})[-\\/](\d{2})(?!\d)")
 
 
 @dataclass(frozen=True)
@@ -397,6 +417,169 @@ def extract_hermes_skill_name(tool_name: Any, content: Any) -> str:
     return tool or "skill"
 
 
+def sqlite_table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
+    except sqlite3.Error:
+        return set()
+
+
+def sqlite_column_expr(alias: str, columns: set[str], candidates: Iterable[str], output: str) -> str:
+    for column in candidates:
+        if column in columns:
+            return f"{alias}.{column} AS {output}"
+    return f"NULL AS {output}"
+
+
+def sqlite_coalesce_expr(candidates: list[str], output: str, fallback: str = "0") -> str:
+    if not candidates:
+        return f"{fallback} AS {output}"
+    if len(candidates) == 1:
+        return f"{candidates[0]} AS {output}"
+    return f"COALESCE({', '.join(candidates)}) AS {output}"
+
+
+def hermes_json_value(value: Any, keys: Iterable[str]) -> str:
+    if value in (None, ""):
+        return ""
+    data = value
+    if isinstance(value, str):
+        try:
+            data = json.loads(value)
+        except json.JSONDecodeError:
+            return ""
+    key_set = set(keys)
+
+    def walk(item: Any) -> str:
+        if isinstance(item, dict):
+            for key in key_set:
+                found = item.get(key)
+                if isinstance(found, str) and found:
+                    return found
+            for child in item.values():
+                found = walk(child)
+                if found:
+                    return found
+        elif isinstance(item, list):
+            for child in item:
+                found = walk(child)
+                if found:
+                    return found
+        return ""
+
+    return walk(data)
+
+
+def hermes_json_has_key(value: Any, keys: Iterable[str]) -> bool:
+    if value in (None, ""):
+        return False
+    data = value
+    if isinstance(value, str):
+        try:
+            data = json.loads(value)
+        except json.JSONDecodeError:
+            return False
+    key_set = set(keys)
+
+    def walk(item: Any) -> bool:
+        if isinstance(item, dict):
+            if any(key in item and item.get(key) not in (None, "") for key in key_set):
+                return True
+            return any(walk(child) for child in item.values())
+        if isinstance(item, list):
+            return any(walk(child) for child in item)
+        return False
+
+    return walk(data)
+
+
+def hermes_is_tool_message(role: Any, content: Any, metadata: Any, raw_tool_name: Any, tool_call_id: Any = None, tool_calls: Any = None) -> bool:
+    if hermes_tool_calls(tool_calls):
+        return True
+    if raw_tool_name not in (None, "") or tool_call_id not in (None, ""):
+        return True
+    if hermes_json_value(metadata, ("tool_name", "toolName", "tool")) or hermes_json_value(content, ("tool_name", "toolName", "tool")):
+        return True
+    role_text = str(role or "").strip().lower()
+    if role_text in HERMES_TOOL_MESSAGE_TYPES:
+        return True
+    return hermes_json_has_key(metadata, HERMES_TOOL_ID_KEYS) or hermes_json_has_key(content, HERMES_TOOL_ID_KEYS)
+
+
+def hermes_tool_name(raw_tool_name: Any, content: Any, metadata: Any) -> str:
+    name = first_string(str(raw_tool_name) if raw_tool_name is not None else "")
+    if name:
+        return name
+    # Only explicit tool-name fields are trusted here.  Hermes tool-result
+    # message content can contain arbitrary JSON such as {"name": "..."};
+    # treating every nested "name" as a tool name incorrectly counts normal
+    # result payload fields as Tool calls.
+    return first_string(
+        hermes_json_value(metadata, ("tool_name", "toolName", "tool")),
+        hermes_json_value(content, ("tool_name", "toolName", "tool")),
+    )
+
+
+def parse_json_maybe(value: Any) -> Any:
+    if not isinstance(value, str) or not value:
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def hermes_tool_calls(value: Any) -> list[dict[str, Any]]:
+    data = parse_json_maybe(value)
+    if isinstance(data, dict):
+        data = data.get("tool_calls") or data.get("toolCalls") or data.get("calls") or [data]
+    if not isinstance(data, list):
+        return []
+    calls: list[dict[str, Any]] = []
+    for item in data:
+        if isinstance(item, dict):
+            calls.append(item)
+    return calls
+
+
+def hermes_tool_call_name(call: dict[str, Any]) -> str:
+    function = call.get("function")
+    if isinstance(function, dict):
+        name = first_string(function.get("name"), function.get("tool_name"), function.get("toolName"))
+        if name:
+            return name
+    return first_string(call.get("name"), call.get("tool_name"), call.get("toolName"), call.get("tool"))
+
+
+def hermes_tool_call_id(call: dict[str, Any]) -> str:
+    return first_string(call.get("id"), call.get("call_id"), call.get("tool_call_id"), call.get("toolCallId"))
+
+
+def hermes_tool_call_arguments(call: dict[str, Any]) -> Any:
+    function = call.get("function")
+    if isinstance(function, dict):
+        return parse_json_maybe(function.get("arguments"))
+    return parse_json_maybe(call.get("arguments") or call.get("input") or call.get("params"))
+
+
+def hermes_skill_name_from_call(tool_name: str, call: dict[str, Any]) -> str:
+    if not tool_name.startswith("skill"):
+        return ""
+    arguments = hermes_tool_call_arguments(call)
+    if isinstance(arguments, dict):
+        raw_name = first_string(arguments.get("name"), arguments.get("skill_name"), arguments.get("skillName"))
+        if raw_name:
+            path_match = HERMES_SKILL_PATH_RE.search(raw_name)
+            return path_match.group("name") if path_match else normalize_skill_name(raw_name)
+        raw_path = first_string(arguments.get("file_path"), arguments.get("path"))
+        if raw_path:
+            return extract_hermes_skill_name(tool_name, raw_path) or normalize_skill_name(raw_path)
+        return tool_name
+    if isinstance(arguments, str):
+        return extract_hermes_skill_name(tool_name, arguments) or normalize_skill_name(arguments) or tool_name
+    return tool_name
+
+
 def text_from_claude_message(message: dict[str, Any]) -> str:
     content = message.get("content")
     if isinstance(content, str):
@@ -476,20 +659,63 @@ def subtract_usage(current: dict[str, int], previous: dict[str, int]) -> dict[st
     return deltas
 
 
-def discover_logs(paths: list[Path]) -> list[Path]:
+def path_date(path: Path) -> str | None:
+    match = PATH_DATE_RE.search(str(path))
+    if not match:
+        return None
+    return "-".join(match.groups())
+
+
+def date_in_range(date_value: str, since: str | None, until: str | None) -> bool:
+    if since and date_value < since:
+        return False
+    if until and date_value > until:
+        return False
+    return True
+
+
+def file_mtime_date(path: Path, local_tz: ZoneInfo) -> str | None:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).astimezone(local_tz).date().isoformat()
+    except OSError:
+        return None
+
+
+def log_may_overlap_range(path: Path, since: str | None, until: str | None, local_tz: ZoneInfo | None) -> bool:
+    if not since and not until:
+        return True
+    dated = path_date(path)
+    if dated and date_in_range(dated, since, until):
+        return True
+    if local_tz:
+        modified = file_mtime_date(path, local_tz)
+        if modified and date_in_range(modified, since, until):
+            return True
+    return dated is None and local_tz is None
+
+
+def discover_logs(
+    paths: list[Path], since: str | None = None, until: str | None = None, local_tz: ZoneInfo | None = None
+) -> list[Path]:
     logs: list[Path] = []
     for path in paths:
         expanded = path.expanduser()
         if expanded.is_file() and expanded.suffix == ".jsonl":
+            if not log_may_overlap_range(expanded, since, until, local_tz):
+                continue
             logs.append(expanded)
             continue
         if not expanded.is_dir():
             continue
         if expanded.name == ".codex":
-            logs.extend((expanded / "sessions").rglob("*.jsonl"))
-            logs.extend((expanded / "archived_sessions").glob("*.jsonl"))
+            logs.extend(
+                log for log in (expanded / "sessions").rglob("*.jsonl") if log_may_overlap_range(log, since, until, local_tz)
+            )
+            logs.extend(
+                log for log in (expanded / "archived_sessions").glob("*.jsonl") if log_may_overlap_range(log, since, until, local_tz)
+            )
             continue
-        logs.extend(expanded.rglob("*.jsonl"))
+        logs.extend(log for log in expanded.rglob("*.jsonl") if log_may_overlap_range(log, since, until, local_tz))
     return sorted(set(logs))
 
 
@@ -549,19 +775,100 @@ def app_data_candidates(app_name: str) -> list[Path]:
 
 
 def default_codex_paths() -> list[Path]:
-    return existing_or_all([Path("~/.codex"), *app_data_candidates("codex")])
+    return existing_or_all([Path("~/.codex"), *app_data_candidates("codex"), *app_data_candidates("Codex")])
 
 
 def default_opencode_paths() -> list[Path]:
-    return existing_or_all([*app_data_candidates("opencode"), Path("~/.local/share/opencode")])
+    return existing_or_all(
+        [
+            env_path("OPENCODE_DATA_DIR") or Path("~/.local/share/opencode"),
+            Path("~/.config/opencode"),
+            *app_data_candidates("opencode"),
+            *app_data_candidates("OpenCode"),
+        ]
+    )
 
 
 def default_claude_paths() -> list[Path]:
-    return existing_or_all([Path("~/.claude"), *app_data_candidates("Claude"), *app_data_candidates("claude")])
+    return existing_or_all([Path("~/.claude"), Path("~/.claude.json"), *app_data_candidates("Claude"), *app_data_candidates("claude")])
 
 
 def default_hermes_paths() -> list[Path]:
-    return existing_or_all([Path("~/.hermes"), *app_data_candidates("hermes")])
+    return existing_or_all([Path("~/.hermes"), *app_data_candidates("hermes"), *wsl_hermes_paths()])
+
+
+def wsl_hermes_paths() -> list[Path]:
+    if os.name != "nt":
+        return []
+    candidates: list[Path] = []
+    distro_names = [
+        "Ubuntu",
+        "Ubuntu-24.04",
+        "Ubuntu-22.04",
+        "Ubuntu-20.04",
+        "Debian",
+        "kali-linux",
+        "openSUSE-Leap-15.6",
+        "SUSE-Linux-Enterprise-15-SP6",
+    ]
+    try:
+        result = subprocess.run(["wsl.exe", "-l", "-q"], capture_output=True, timeout=3, check=False)
+        raw = result.stdout.decode("utf-16le", errors="ignore").replace("\x00", "")
+        distro_names.extend(line.strip() for line in raw.splitlines() if line.strip())
+    except Exception:
+        pass
+    distro_names = list(dict.fromkeys(distro_names))
+    explicit_home = os.environ.get("HERMES_WSL_HOME")
+    if explicit_home:
+        candidates.append(Path(explicit_home) / ".hermes")
+    # Prefer the modern WSL UNC provider. Including both \\wsl.localhost and
+    # the legacy \\wsl$ aliases would double-count the same Hermes databases.
+    for root_name in (r"\\wsl.localhost",):
+        before_count = len(candidates)
+        for distro_name in distro_names:
+            distro = Path(f"{root_name}\\{distro_name}")
+            home = Path(f"{root_name}\\{distro_name}\\home")
+            try:
+                users = [item for item in home.iterdir() if item.is_dir()]
+            except OSError:
+                continue
+            for user_home in users:
+                user_hermes = user_home / ".hermes"
+                try:
+                    if user_hermes.exists():
+                        candidates.append(user_hermes)
+                except OSError:
+                    continue
+            root_home = distro / "root" / ".hermes"
+            try:
+                if root_home.exists():
+                    candidates.append(root_home)
+            except OSError:
+                pass
+        if len(candidates) > before_count:
+            break
+    return unique_paths(candidates)
+
+
+def is_wsl_unc_path(path: Path) -> bool:
+    value = str(path).replace("/", "\\").lower()
+    return value.startswith("\\\\wsl.localhost\\") or value.startswith("\\\\wsl$\\")
+
+
+def sqlite_readonly_uri(path: Path, immutable: bool = False) -> str:
+    uri = f"file:{path}?mode=ro"
+    if immutable:
+        uri += "&immutable=1"
+    return uri
+
+
+def sqlite_has_table(connection: sqlite3.Connection, table_name: str) -> bool:
+    return bool(
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+    )
 
 
 def session_id_from_path(path: Path) -> str:
@@ -647,10 +954,87 @@ def parse_codex_log(path: Path, local_tz: ZoneInfo) -> Iterable[UsageEvent]:
             )
 
 
-def load_codex_events(paths: list[Path], local_tz: ZoneInfo) -> list[UsageEvent]:
+def load_codex_events(
+    paths: list[Path], local_tz: ZoneInfo, since: str | None = None, until: str | None = None
+) -> list[UsageEvent]:
     events: list[UsageEvent] = []
-    for log in discover_logs(paths):
+    for log in discover_logs(paths, since, until, local_tz):
         events.extend(parse_codex_log(log, local_tz))
+    jsonl_session_ids = {event.session_id for event in events}
+    for event in load_codex_state_events(paths, local_tz):
+        if event.session_id not in jsonl_session_ids:
+            events.append(event)
+    return sorted(events, key=lambda event: event.timestamp)
+
+
+def discover_codex_state_dbs(paths: list[Path]) -> list[Path]:
+    dbs: list[Path] = []
+    for path in paths:
+        expanded = path.expanduser()
+        if expanded.is_file() and expanded.suffix in (".sqlite", ".db"):
+            dbs.append(expanded)
+            continue
+        if not expanded.is_dir():
+            continue
+        for pattern in ("state*.sqlite", "state*.db"):
+            dbs.extend(item for item in expanded.glob(pattern) if item.is_file())
+    return sorted(set(dbs))
+
+
+def parse_codex_state_db(path: Path, local_tz: ZoneInfo) -> Iterable[UsageEvent]:
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        print(f"warning: cannot open Codex database {path}: {exc}", file=sys.stderr)
+        return
+
+    query = """
+        SELECT
+            id,
+            COALESCE(updated_at_ms, updated_at * 1000, created_at_ms, created_at * 1000),
+            model_provider,
+            model,
+            cwd,
+            tokens_used,
+            rollout_path
+        FROM threads
+        WHERE COALESCE(tokens_used, 0) > 0
+        ORDER BY COALESCE(updated_at_ms, updated_at * 1000, created_at_ms, created_at * 1000), id
+    """
+    try:
+        has_threads = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads'"
+        ).fetchone()
+        if not has_threads:
+            return
+        for session_id, timestamp_raw, provider, model, cwd, total_tokens, rollout_path in connection.execute(query):
+            if timestamp_raw is None:
+                continue
+            timestamp = parse_epoch_millis(timestamp_raw, local_tz)
+            model_name = str(model or "unknown")
+            if provider:
+                model_name = f"{provider}/{model_name}"
+            yield UsageEvent(
+                timestamp=timestamp,
+                date=timestamp.date().isoformat(),
+                tool="codex",
+                session_id=str(session_id),
+                model=model_name,
+                cwd=str(cwd or ""),
+                source=str(rollout_path or path),
+                total_tokens=safe_int(total_tokens),
+                api_requests=1,
+            )
+    except sqlite3.Error as exc:
+        print(f"warning: cannot read Codex database {path}: {exc}", file=sys.stderr)
+    finally:
+        connection.close()
+
+
+def load_codex_state_events(paths: list[Path], local_tz: ZoneInfo) -> list[UsageEvent]:
+    events: list[UsageEvent] = []
+    for db in discover_codex_state_dbs(paths):
+        events.extend(parse_codex_state_db(db, local_tz))
     return sorted(events, key=lambda event: event.timestamp)
 
 
@@ -741,9 +1125,11 @@ def parse_codex_tool_log(path: Path, local_tz: ZoneInfo) -> Iterable[ToolCallEve
                 )
 
 
-def load_codex_tool_events(paths: list[Path], local_tz: ZoneInfo) -> list[ToolCallEvent]:
+def load_codex_tool_events(
+    paths: list[Path], local_tz: ZoneInfo, since: str | None = None, until: str | None = None
+) -> list[ToolCallEvent]:
     events: list[ToolCallEvent] = []
-    for log in discover_logs(paths):
+    for log in discover_logs(paths, since, until, local_tz):
         events.extend(parse_codex_tool_log(log, local_tz))
     return sorted(events, key=lambda event: event.timestamp)
 
@@ -985,7 +1371,7 @@ def hermes_profile_name(path: Path) -> str:
 
 def parse_hermes_db(path: Path, local_tz: ZoneInfo) -> Iterable[UsageEvent]:
     try:
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        connection = sqlite3.connect(sqlite_readonly_uri(path, immutable=is_wsl_unc_path(path)), uri=True)
     except sqlite3.Error as exc:
         print(f"warning: cannot open Hermes database {path}: {exc}", file=sys.stderr)
         return
@@ -1007,6 +1393,11 @@ def parse_hermes_db(path: Path, local_tz: ZoneInfo) -> Iterable[UsageEvent]:
         ORDER BY COALESCE(ended_at, started_at), id
     """
     try:
+        has_sessions = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'"
+        ).fetchone()
+        if not has_sessions:
+            return
         profile = hermes_profile_name(path)
         cwd = str(path.parent)
         for row in connection.execute(query):
@@ -1064,47 +1455,85 @@ def load_hermes_events(paths: list[Path], local_tz: ZoneInfo) -> list[UsageEvent
 
 def load_hermes_tool_events_from_db(path: Path, local_tz: ZoneInfo) -> list[ToolCallEvent]:
     try:
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        connection = sqlite3.connect(sqlite_readonly_uri(path, immutable=is_wsl_unc_path(path)), uri=True)
     except sqlite3.Error as exc:
         print(f"warning: cannot open Hermes database {path}: {exc}", file=sys.stderr)
         return []
 
-    query = """
-        SELECT
-            m.id,
-            m.session_id,
-            m.tool_name,
-            COALESCE(s.ended_at, s.started_at, m.timestamp),
-            s.source,
-            s.model
-        FROM messages m
-        LEFT JOIN sessions s ON s.id = m.session_id
-        WHERE COALESCE(m.tool_name, '') <> ''
-        ORDER BY m.timestamp, m.id
-    """
     events: list[ToolCallEvent] = []
     try:
+        has_messages = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'"
+        ).fetchone()
+        if not has_messages:
+            return []
+        message_columns = sqlite_table_columns(connection, "messages")
+        session_columns = sqlite_table_columns(connection, "sessions")
+        has_sessions = bool(session_columns)
+        message_id_expr = sqlite_column_expr("m", message_columns, ("id", "message_id", "messageId"), "message_id")
+        session_id_expr = sqlite_column_expr("m", message_columns, ("session_id", "sessionId", "conversation_id"), "session_id")
+        tool_name_expr = sqlite_column_expr("m", message_columns, ("tool_name", "toolName", "tool"), "tool_name")
+        role_expr = sqlite_column_expr("m", message_columns, ("role", "type"), "role")
+        content_expr = sqlite_column_expr("m", message_columns, ("content", "data", "message", "metadata"), "content")
+        metadata_expr = sqlite_column_expr("m", message_columns, ("metadata", "extra", "data"), "metadata")
+        tool_calls_expr = sqlite_column_expr("m", message_columns, ("tool_calls", "toolCalls"), "tool_calls")
+        session_source_expr = sqlite_column_expr("s", session_columns, ("source", "provider"), "session_source") if has_sessions else "NULL AS session_source"
+        model_expr = sqlite_column_expr("s", session_columns, ("model", "model_id", "modelId"), "model") if has_sessions else "NULL AS model"
+        timestamp_candidates = []
+        if has_sessions:
+            timestamp_candidates.extend(f"s.{column}" for column in ("ended_at", "endedAt", "started_at", "startedAt") if column in session_columns)
+        timestamp_candidates.extend(f"m.{column}" for column in ("timestamp", "created_at", "createdAt", "time") if column in message_columns)
+        timestamp_expr = sqlite_coalesce_expr(timestamp_candidates, "timestamp_raw")
+        join_clause = "LEFT JOIN sessions s ON s.id = m.session_id" if has_sessions and "session_id" in message_columns and "id" in session_columns else ""
+        order_expr = "m.timestamp" if "timestamp" in message_columns else "m.rowid"
+        query = f"""
+            SELECT
+                {message_id_expr},
+                {session_id_expr},
+                {tool_name_expr},
+                {role_expr},
+                {timestamp_expr},
+                {content_expr},
+                {metadata_expr},
+                {tool_calls_expr},
+                {session_source_expr},
+                {model_expr}
+            FROM messages m
+            {join_clause}
+            ORDER BY {order_expr}, m.rowid
+        """
         profile = hermes_profile_name(path)
         cwd = str(path.parent)
-        for message_id, session_id, tool_name, timestamp_raw, session_source, model in connection.execute(query):
+        for message_id, session_id, raw_tool_name, role, timestamp_raw, content, metadata, tool_calls_raw, session_source, model in connection.execute(query):
+            if not hermes_is_tool_message(role, content, metadata, raw_tool_name, tool_calls=tool_calls_raw):
+                continue
+            tool_calls = hermes_tool_calls(tool_calls_raw)
+            fallback_tool_name = hermes_tool_name(raw_tool_name, content, metadata)
+            names_and_ids = [
+                (hermes_tool_call_name(call), hermes_tool_call_id(call) or f"{profile}:{message_id}:{index}")
+                for index, call in enumerate(tool_calls, 1)
+            ] or [(fallback_tool_name, f"{profile}:{message_id}")]
             timestamp = parse_epoch_seconds(timestamp_raw, local_tz)
             model_name = str(model or "unknown")
             if session_source:
                 model_name = f"{session_source}/{model_name}"
-            events.append(
-                ToolCallEvent(
-                    timestamp=timestamp,
-                    date=timestamp.date().isoformat(),
-                    source_tool="hermes",
-                    tool_name=str(tool_name or "unknown"),
-                    skill=skill_for_tool(str(tool_name or "unknown")),
-                    session_id=f"{profile}:{session_id}",
-                    request_id=f"{profile}:{message_id}",
-                    model=model_name,
-                    cwd=cwd,
-                    source=str(path),
+            for tool_name, request_id in names_and_ids:
+                if not tool_name:
+                    continue
+                events.append(
+                    ToolCallEvent(
+                        timestamp=timestamp,
+                        date=timestamp.date().isoformat(),
+                        source_tool="hermes",
+                        tool_name=str(tool_name or "unknown"),
+                        skill=skill_for_tool(str(tool_name or "unknown")),
+                        session_id=f"{profile}:{session_id}",
+                        request_id=str(request_id),
+                        model=model_name,
+                        cwd=cwd,
+                        source=str(path),
+                    )
                 )
-            )
     except sqlite3.Error as exc:
         print(f"warning: cannot read Hermes tool events {path}: {exc}", file=sys.stderr)
     finally:
@@ -1121,56 +1550,94 @@ def load_hermes_tool_events(paths: list[Path], local_tz: ZoneInfo) -> list[ToolC
 
 def load_hermes_skill_events_from_db(path: Path, local_tz: ZoneInfo) -> list[SkillInvocationEvent]:
     try:
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        connection = sqlite3.connect(sqlite_readonly_uri(path, immutable=is_wsl_unc_path(path)), uri=True)
     except sqlite3.Error as exc:
         print(f"warning: cannot open Hermes database {path}: {exc}", file=sys.stderr)
         return []
 
-    query = """
-        SELECT
-            m.id,
-            m.session_id,
-            m.tool_call_id,
-            m.tool_name,
-            COALESCE(s.ended_at, s.started_at, m.timestamp),
-            m.content,
-            s.source,
-            s.model
-        FROM messages m
-        LEFT JOIN sessions s ON s.id = m.session_id
-        WHERE m.role = 'tool'
-          AND m.tool_name LIKE 'skill%'
-        ORDER BY m.timestamp, m.id
-    """
     events: list[SkillInvocationEvent] = []
     try:
+        has_messages = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'"
+        ).fetchone()
+        if not has_messages:
+            return []
+        message_columns = sqlite_table_columns(connection, "messages")
+        session_columns = sqlite_table_columns(connection, "sessions")
+        has_sessions = bool(session_columns)
+        message_id_expr = sqlite_column_expr("m", message_columns, ("id", "message_id", "messageId"), "message_id")
+        session_id_expr = sqlite_column_expr("m", message_columns, ("session_id", "sessionId", "conversation_id"), "session_id")
+        tool_call_id_expr = sqlite_column_expr("m", message_columns, ("tool_call_id", "toolCallId", "call_id"), "tool_call_id")
+        tool_name_expr = sqlite_column_expr("m", message_columns, ("tool_name", "toolName", "tool"), "tool_name")
+        role_expr = sqlite_column_expr("m", message_columns, ("role", "type"), "role")
+        content_expr = sqlite_column_expr("m", message_columns, ("content", "data", "message", "metadata"), "content")
+        metadata_expr = sqlite_column_expr("m", message_columns, ("metadata", "extra", "data"), "metadata")
+        tool_calls_expr = sqlite_column_expr("m", message_columns, ("tool_calls", "toolCalls"), "tool_calls")
+        session_source_expr = sqlite_column_expr("s", session_columns, ("source", "provider"), "session_source") if has_sessions else "NULL AS session_source"
+        model_expr = sqlite_column_expr("s", session_columns, ("model", "model_id", "modelId"), "model") if has_sessions else "NULL AS model"
+        timestamp_candidates = []
+        if has_sessions:
+            timestamp_candidates.extend(f"s.{column}" for column in ("ended_at", "endedAt", "started_at", "startedAt") if column in session_columns)
+        timestamp_candidates.extend(f"m.{column}" for column in ("timestamp", "created_at", "createdAt", "time") if column in message_columns)
+        timestamp_expr = sqlite_coalesce_expr(timestamp_candidates, "timestamp_raw")
+        join_clause = "LEFT JOIN sessions s ON s.id = m.session_id" if has_sessions and "session_id" in message_columns and "id" in session_columns else ""
+        order_expr = "m.timestamp" if "timestamp" in message_columns else "m.rowid"
+        query = f"""
+            SELECT
+                {message_id_expr},
+                {session_id_expr},
+                {tool_call_id_expr},
+                {tool_name_expr},
+                {role_expr},
+                {timestamp_expr},
+                {content_expr},
+                {metadata_expr},
+                {tool_calls_expr},
+                {session_source_expr},
+                {model_expr}
+            FROM messages m
+            {join_clause}
+            ORDER BY {order_expr}, m.rowid
+        """
         profile = hermes_profile_name(path)
         cwd = str(path.parent)
-        for message_id, session_id, tool_call_id, tool_name, timestamp_raw, content, session_source, model in connection.execute(query):
-            skill_name = extract_hermes_skill_name(tool_name, content)
-            if not skill_name:
+        for message_id, session_id, tool_call_id, raw_tool_name, role, timestamp_raw, content, metadata, tool_calls_raw, session_source, model in connection.execute(query):
+            if not hermes_is_tool_message(role, content, metadata, raw_tool_name, tool_call_id, tool_calls_raw):
                 continue
             timestamp = parse_epoch_seconds(timestamp_raw, local_tz)
             model_name = str(model or "unknown")
             if session_source:
                 model_name = f"{session_source}/{model_name}"
-            events.append(
-                SkillInvocationEvent(
-                    timestamp=timestamp,
-                    date=timestamp.date().isoformat(),
-                    source_tool="hermes",
-                    skill_name=skill_name,
-                    skill_command=skill_name,
-                    skill_source="hermes",
-                    plugin_name="",
-                    invocation_type=str(tool_name or "skill"),
-                    session_id=f"{profile}:{session_id}",
-                    request_id=str(tool_call_id or f"{profile}:{message_id}"),
-                    model=model_name,
-                    cwd=cwd,
-                    source=str(path),
+            tool_calls = hermes_tool_calls(tool_calls_raw)
+            if tool_calls:
+                skill_candidates = []
+                for index, call in enumerate(tool_calls, 1):
+                    tool_name = hermes_tool_call_name(call)
+                    skill_name = hermes_skill_name_from_call(tool_name, call)
+                    if skill_name:
+                        skill_candidates.append((tool_name, skill_name, hermes_tool_call_id(call) or f"{profile}:{message_id}:{index}"))
+            else:
+                tool_name = hermes_tool_name(raw_tool_name, content, metadata)
+                skill_name = extract_hermes_skill_name(tool_name, content) or extract_hermes_skill_name(tool_name, metadata)
+                skill_candidates = [(tool_name, skill_name, str(tool_call_id or f"{profile}:{message_id}"))] if skill_name else []
+            for tool_name, skill_name, request_id in skill_candidates:
+                events.append(
+                    SkillInvocationEvent(
+                        timestamp=timestamp,
+                        date=timestamp.date().isoformat(),
+                        source_tool="hermes",
+                        skill_name=skill_name,
+                        skill_command=skill_name,
+                        skill_source="hermes",
+                        plugin_name="",
+                        invocation_type=str(tool_name or "skill"),
+                        session_id=f"{profile}:{session_id}",
+                        request_id=str(request_id),
+                        model=model_name,
+                        cwd=cwd,
+                        source=str(path),
+                    )
                 )
-            )
     except sqlite3.Error as exc:
         print(f"warning: cannot read Hermes skill events {path}: {exc}", file=sys.stderr)
     finally:
@@ -1185,20 +1652,24 @@ def load_hermes_skill_events(paths: list[Path], local_tz: ZoneInfo) -> list[Skil
     return sorted(events, key=lambda event: event.timestamp)
 
 
-def discover_claude_logs(paths: list[Path]) -> list[Path]:
+def discover_claude_logs(
+    paths: list[Path], since: str | None = None, until: str | None = None, local_tz: ZoneInfo | None = None
+) -> list[Path]:
     logs: list[Path] = []
     for path in paths:
         expanded = path.expanduser()
         if expanded.is_file() and expanded.suffix == ".jsonl":
+            if not log_may_overlap_range(expanded, since, until, local_tz):
+                continue
             logs.append(expanded)
             continue
         if not expanded.is_dir():
             continue
         projects = expanded / "projects"
         if expanded.name == ".claude" and projects.is_dir():
-            logs.extend(projects.rglob("*.jsonl"))
+            logs.extend(log for log in projects.rglob("*.jsonl") if log_may_overlap_range(log, since, until, local_tz))
             continue
-        logs.extend(expanded.rglob("*.jsonl"))
+        logs.extend(log for log in expanded.rglob("*.jsonl") if log_may_overlap_range(log, since, until, local_tz))
     return sorted(set(logs))
 
 
@@ -1276,9 +1747,11 @@ def parse_claude_log(path: Path, local_tz: ZoneInfo) -> Iterable[UsageEvent]:
             )
 
 
-def load_claude_events(paths: list[Path], local_tz: ZoneInfo) -> list[UsageEvent]:
+def load_claude_events(
+    paths: list[Path], local_tz: ZoneInfo, since: str | None = None, until: str | None = None
+) -> list[UsageEvent]:
     events: list[UsageEvent] = []
-    for log in discover_claude_logs(paths):
+    for log in discover_claude_logs(paths, since, until, local_tz):
         events.extend(parse_claude_log(log, local_tz))
     return sorted(events, key=lambda event: event.timestamp)
 
@@ -1364,9 +1837,11 @@ def parse_claude_tool_log(path: Path, local_tz: ZoneInfo) -> Iterable[ToolCallEv
                 )
 
 
-def load_claude_tool_events(paths: list[Path], local_tz: ZoneInfo) -> list[ToolCallEvent]:
+def load_claude_tool_events(
+    paths: list[Path], local_tz: ZoneInfo, since: str | None = None, until: str | None = None
+) -> list[ToolCallEvent]:
     events: list[ToolCallEvent] = []
-    for log in discover_claude_logs(paths):
+    for log in discover_claude_logs(paths, since, until, local_tz):
         events.extend(parse_claude_tool_log(log, local_tz))
     return sorted(events, key=lambda event: event.timestamp)
 
@@ -1462,11 +1937,13 @@ def load_skill_events(
     hermes_paths: list[Path],
     local_tz: ZoneInfo,
     cwds: Iterable[str],
+    since: str | None = None,
+    until: str | None = None,
 ) -> list[SkillInvocationEvent]:
     events: list[SkillInvocationEvent] = []
     if source in ("claude", "all"):
         registry = scan_skill_registry(cwds)
-        for log in discover_claude_logs(claude_paths):
+        for log in discover_claude_logs(claude_paths, since, until, local_tz):
             events.extend(parse_claude_skill_log(log, local_tz, registry))
     if source in ("hermes", "all"):
         events.extend(load_hermes_skill_events(hermes_paths, local_tz))
@@ -1624,15 +2101,17 @@ def load_tool_events(
     claude_paths: list[Path],
     hermes_paths: list[Path],
     local_tz: ZoneInfo,
+    since: str | None = None,
+    until: str | None = None,
 ) -> list[ToolCallEvent]:
     events: list[ToolCallEvent] = []
     if source in ("codex", "all"):
-        events.extend(load_codex_tool_events(codex_paths, local_tz))
+        events.extend(load_codex_tool_events(codex_paths, local_tz, since, until))
     if source in ("opencode", "all"):
         for db in discover_opencode_dbs(opencode_paths):
             events.extend(load_opencode_tool_events_from_db(db, local_tz))
     if source in ("claude", "all"):
-        events.extend(load_claude_tool_events(claude_paths, local_tz))
+        events.extend(load_claude_tool_events(claude_paths, local_tz, since, until))
     if source in ("hermes", "all"):
         events.extend(load_hermes_tool_events(hermes_paths, local_tz))
     return sorted(events, key=lambda event: event.timestamp)
@@ -1646,14 +2125,16 @@ def load_events(
     hermes_paths: list[Path],
     local_tz: ZoneInfo,
     custom_sources: list[dict[str, Any]] | None = None,
+    since: str | None = None,
+    until: str | None = None,
 ) -> list[UsageEvent]:
     events: list[UsageEvent] = []
     if source in ("codex", "all"):
-        events.extend(load_codex_events(codex_paths, local_tz))
+        events.extend(load_codex_events(codex_paths, local_tz, since, until))
     if source in ("opencode", "all"):
         events.extend(load_opencode_events(opencode_paths, local_tz))
     if source in ("claude", "all"):
-        events.extend(load_claude_events(claude_paths, local_tz))
+        events.extend(load_claude_events(claude_paths, local_tz, since, until))
     if source in ("hermes", "all"):
         events.extend(load_hermes_events(hermes_paths, local_tz))
     for config in custom_sources or []:
@@ -1832,11 +2313,17 @@ def output_doctor(
     print(f"Price config: {price_config.expanduser() if price_config else '(none)'}")
 
     codex_logs = discover_logs(codex_paths)
+    codex_dbs = discover_codex_state_dbs(codex_paths)
     opencode_dbs = discover_opencode_dbs(opencode_paths)
     claude_logs = discover_claude_logs(claude_paths)
     hermes_dbs = discover_hermes_dbs(hermes_paths)
 
-    print_path_status("Codex", codex_paths, codex_logs, len(load_codex_events(codex_paths, local_tz)) if codex_logs else 0)
+    print_path_status(
+        "Codex",
+        codex_paths,
+        [*codex_logs, *codex_dbs],
+        len(load_codex_events(codex_paths, local_tz)) if (codex_logs or codex_dbs) else 0,
+    )
     print_path_status("OpenCode", opencode_paths, opencode_dbs, len(load_opencode_events(opencode_paths, local_tz)) if opencode_dbs else 0)
     print_path_status("Claude Code", claude_paths, claude_logs, len(load_claude_events(claude_paths, local_tz)) if claude_logs else 0)
     print_path_status("Hermes", hermes_paths, hermes_dbs, len(load_hermes_events(hermes_paths, local_tz)) if hermes_dbs else 0)
@@ -1849,7 +2336,7 @@ def output_doctor(
             len(load_custom_source_events(config, local_tz)) if logs else 0,
         )
 
-    if not any((codex_logs, opencode_dbs, claude_logs, hermes_dbs)):
+    if not any((codex_logs, codex_dbs, opencode_dbs, claude_logs, hermes_dbs)):
         print("\nNo data sources were found. Create ai-token-usage.json or pass --*-path flags to point to your app data.")
     print("\nNotes:")
     print("  - Codex/OpenCode/Claude Code hourly charts use event/message/usage-record timestamps.")
@@ -1928,7 +2415,19 @@ def tool_rollup(events: Iterable[ToolCallEvent], key_fields: tuple[str, ...]) ->
         row["api_requests"] = len(requests[key])
         row["sessions"] = len(sessions[key])
         rows.append(row)
-    return sorted(rows, key=lambda row: row["total_tokens"], reverse=True)
+    return sorted(
+        rows,
+        key=lambda row: (
+            row.get("calls", 0),
+            row.get("api_requests", 0),
+            row.get("total_tokens", 0),
+            str(row.get("source_tool", "")),
+            str(row.get("skill", "")),
+            str(row.get("tool_name", "")),
+            str(row.get("skill_name", "")),
+        ),
+        reverse=True,
+    )
 
 
 def totals(
@@ -2098,13 +2597,15 @@ def summary_payload(
     tool_events: list[ToolCallEvent] | None = None,
     skill_events: list[SkillInvocationEvent] | None = None,
     custom_sources: list[dict[str, Any]] | None = None,
+    include_events: bool = True,
 ) -> dict[str, Any]:
     tool_events = tool_events or []
     skill_events = skill_events or []
     by_tool_category = tool_rollup(tool_events, ("source_tool", "skill"))
-    return {
+    payload = {
         "source": source,
         "sources": sorted({event.tool for event in events}),
+        "event_count": len(events),
         "available_sources": [
             {"key": "codex", "label": "Codex"},
             {"key": "opencode", "label": "OpenCode"},
@@ -2130,11 +2631,13 @@ def summary_payload(
         "by_skill_invocation": tool_rollup(
             skill_events, ("source_tool", "skill_name", "skill_source", "plugin_name", "invocation_type")
         ),
-        "tool_events": [event.as_dict() for event in tool_events],
-        "skill_events": [event.as_dict() for event in skill_events],
-        "events": [event.as_dict() for event in events],
         "has_price_config": bool(prices),
     }
+    if include_events:
+        payload["tool_events"] = [event.as_dict() for event in tool_events]
+        payload["skill_events"] = [event.as_dict() for event in skill_events]
+        payload["events"] = [event.as_dict() for event in events]
+    return payload
 
 
 def output_json(
@@ -2273,12 +2776,55 @@ HTML_PAGE = r"""<!doctype html>
       font: inherit;
     }
     button { cursor: pointer; transition: all 0.18s ease; }
+    button:disabled { cursor: not-allowed; opacity: 0.68; transform: none; }
     button:hover { transform: translateY(-1px); border-color: rgba(37, 99, 235, 0.35); }
     .date-popover button:hover { transform: none; }
     button.tab { border-color: transparent; background: transparent; min-height: 32px; padding: 0 12px; }
     button.tab.active { background: linear-gradient(135deg, var(--text), #24324b); border-color: transparent; color: white; box-shadow: 0 8px 18px rgba(17, 24, 39, 0.18); }
     button.primary { background: linear-gradient(135deg, var(--accent), #38bdf8); border-color: transparent; color: white; box-shadow: 0 10px 24px rgba(37, 99, 235, 0.24); font-weight: 700; }
     main { padding: 24px 0 44px; }
+    .loading-banner {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      right: auto;
+      z-index: 2147483647;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      min-height: 42px;
+      min-width: 220px;
+      padding: 0 18px;
+      border: 1px solid rgba(37, 99, 235, 0.18);
+      border-radius: 999px;
+      background: linear-gradient(90deg, rgba(219, 234, 254, 0.94), rgba(240, 249, 255, 0.94));
+      color: #1d4ed8;
+      font-size: 13px;
+      font-weight: 750;
+      box-shadow: 0 18px 42px rgba(37, 99, 235, 0.22);
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      backdrop-filter: blur(14px);
+    }
+    .loading-banner.show { display: flex; }
+    .loading-banner.error {
+      background: linear-gradient(90deg, rgba(254, 226, 226, 0.96), rgba(255, 247, 237, 0.96));
+      border-color: rgba(180, 35, 24, 0.2);
+      color: var(--danger);
+    }
+    .spinner {
+      width: 15px;
+      height: 15px;
+      border: 2px solid rgba(37, 99, 235, 0.22);
+      border-top-color: var(--accent);
+      border-radius: 999px;
+      animation: spin 0.82s linear infinite;
+    }
+    .loading-banner.error .spinner {
+      display: none;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
     .cards {
       display: grid;
       grid-template-columns: repeat(6, minmax(0, 1fr));
@@ -2461,6 +3007,10 @@ HTML_PAGE = r"""<!doctype html>
   </style>
 </head>
 <body>
+  <div class="loading-banner" id="loading-banner" role="status" aria-live="polite">
+    <span class="spinner" aria-hidden="true"></span>
+    <span id="loading-text">正在加载用量数据...</span>
+  </div>
   <header>
     <div class="wrap topbar">
       <div>
@@ -2527,7 +3077,22 @@ HTML_PAGE = r"""<!doctype html>
     let untilDate = null;
     let draftStart = null;
     let visibleMonth = null;
+    let loadingCount = 0;
+    let loadSequence = 0;
     let sourceLabels = { codex: 'Codex', opencode: 'OpenCode', claude: 'Claude Code', hermes: 'Hermes', custom: '自定义', all: '全部' };
+
+    function setLoading(isLoading, message = '正在加载用量数据...', isError = false) {
+      const banner = document.getElementById('loading-banner');
+      const text = document.getElementById('loading-text');
+      const refresh = document.getElementById('refresh');
+      if (text) text.textContent = message;
+      banner.classList.toggle('show', isLoading || isError);
+      banner.classList.toggle('error', isError);
+      if (refresh) {
+        refresh.disabled = isLoading;
+        refresh.textContent = isLoading ? '加载中...' : '刷新';
+      }
+    }
 
     function rowCells(row, columns) {
       return columns.map(([key, label, cls]) => `<td class="${cls || ''}" title="${escapeHtml(String(row[key] ?? ''))}">${escapeHtml(formatValue(key, row[key]))}</td>`).join('');
@@ -2800,22 +3365,57 @@ HTML_PAGE = r"""<!doctype html>
     }
 
     async function load() {
-      const params = new URLSearchParams({ source: activeSource });
-      if (sinceDate) params.set('since', localISODate(sinceDate));
-      if (untilDate) params.set('until', localISODate(untilDate));
-      const qs = `?${params.toString()}`;
-      const res = await fetch(`/api/summary${qs}`, { cache: 'no-store' });
-      const data = await res.json();
-      renderSourceTabs(data.available_sources);
-      renderCards(data.totals, data.has_price_config);
-      renderBars('daily', data.by_day, 'date');
-      renderHourly(data.events || data.by_hour || []);
-      renderTable('models', data.by_model.sort((a, b) => b.total_tokens - a.total_tokens), [
-        ['tool', '来源'], ['model', '模型'], ['sessions', '会话', 'num'], ['api_requests', 'API 请求', 'num'], ['total_tokens', '总量', 'num'], ['output_tokens', '输出', 'num']
-      ]);
-      renderTable('projects', data.by_project.sort((a, b) => b.total_tokens - a.total_tokens), [
-        ['tool', '来源'], ['project', '项目'], ['sessions', '会话', 'num'], ['api_requests', 'API 请求', 'num'], ['total_tokens', '总量', 'num'], ['cwd', '路径', 'path']
-      ]);
+      const sequence = ++loadSequence;
+      loadingCount += 1;
+      setLoading(true);
+      let failed = false;
+      try {
+        const params = new URLSearchParams({ source: activeSource });
+        if (sinceDate) params.set('since', localISODate(sinceDate));
+        if (untilDate) params.set('until', localISODate(untilDate));
+        const qs = `?${params.toString()}`;
+        const res = await fetch(`/api/summary${qs}`, { cache: 'no-store' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (sequence !== loadSequence) return;
+        renderSourceTabs(data.available_sources);
+        renderCards(data.totals, data.has_price_config);
+        renderBars('daily', data.by_day, 'date');
+        renderHourly(data.by_hour || data.events || []);
+        renderTable('models', data.by_model.sort((a, b) => b.total_tokens - a.total_tokens), [
+          ['tool', '来源'], ['model', '模型'], ['sessions', '会话', 'num'], ['api_requests', 'API 请求', 'num'], ['total_tokens', '总量', 'num'], ['output_tokens', '输出', 'num']
+        ]);
+        renderTable('projects', data.by_project.sort((a, b) => b.total_tokens - a.total_tokens), [
+          ['tool', '来源'], ['project', '项目'], ['sessions', '会话', 'num'], ['api_requests', 'API 请求', 'num'], ['total_tokens', '总量', 'num'], ['cwd', '路径', 'path']
+        ]);
+        renderDetailLoading();
+        const sessionColumns = [
+          ['date', '日期'], ['tool', '来源'], ['project', '项目'], ['model', '模型'], ['api_requests', 'API 请求', 'num'], ['total_tokens', '总量', 'num']
+        ];
+        if (data.has_price_config) sessionColumns.push(['cost_usd', '费用', 'num']);
+        renderTable('sessions', data.sessions, sessionColumns, 15);
+        const eventCount = data.event_count ?? (data.events ? data.events.length : data.totals.usage_records);
+        document.getElementById('meta').textContent = `${sourceLabel(data.source)} · ${token(eventCount)} 条用量记录 · ${token(data.totals.sessions)} 个会话 · ${new Date().toLocaleTimeString('zh-CN')} 已刷新`;
+        loadDetails(params, sequence);
+      } catch (error) {
+        failed = true;
+        console.error(error);
+        document.getElementById('meta').textContent = `加载失败：${error.message || error}`;
+        setLoading(false, `加载失败：${error.message || error}`, true);
+        return;
+      } finally {
+        loadingCount = Math.max(0, loadingCount - 1);
+        if (!failed && loadingCount === 0) setLoading(false);
+      }
+    }
+
+    function renderDetailLoading() {
+      document.getElementById('tool-categories').innerHTML = '<div class="notice">工具明细后台加载中...</div>';
+      document.getElementById('tool-calls').innerHTML = '<div class="notice">Tool 调用后台加载中...</div>';
+      document.getElementById('skill-invocations').innerHTML = '<div class="notice">Skill 调用后台加载中...</div>';
+    }
+
+    function renderDetails(data) {
       renderTable('tool-categories', data.by_tool_category || data.by_skill || [], [
         ['source_tool', '来源'], ['skill', '能力分类'], ['calls', '调用', 'num'], ['api_requests', 'API 请求', 'num'], ['total_tokens', '总量', 'num'], ['input_tokens', '输入', 'num'], ['output_tokens', '输出', 'num']
       ]);
@@ -2825,12 +3425,23 @@ HTML_PAGE = r"""<!doctype html>
       renderTable('skill-invocations', data.by_skill_invocation || [], [
         ['source_tool', '来源'], ['skill_name', 'Skill'], ['skill_source', '来源类型'], ['plugin_name', '插件'], ['invocation_type', '调用类型'], ['calls', '调用', 'num'], ['api_requests', 'API 请求', 'num'], ['sessions', '关联会话数', 'num']
       ]);
-      const sessionColumns = [
-        ['date', '日期'], ['tool', '来源'], ['project', '项目'], ['model', '模型'], ['api_requests', 'API 请求', 'num'], ['total_tokens', '总量', 'num']
-      ];
-      if (data.has_price_config) sessionColumns.push(['cost_usd', '费用', 'num']);
-      renderTable('sessions', data.sessions, sessionColumns, 15);
-      document.getElementById('meta').textContent = `${sourceLabel(data.source)} · ${token(data.events.length)} 条用量记录 · ${token(data.totals.sessions)} 个会话 · ${new Date().toLocaleTimeString('zh-CN')} 已刷新`;
+    }
+
+    async function loadDetails(baseParams, sequence) {
+      const params = new URLSearchParams(baseParams);
+      params.set('details', '1');
+      try {
+        const res = await fetch(`/api/summary?${params.toString()}`, { cache: 'no-store' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (sequence !== loadSequence) return;
+        renderDetails(data);
+      } catch (error) {
+        if (sequence !== loadSequence) return;
+        document.getElementById('tool-categories').innerHTML = `<div class="notice">工具明细加载失败：${escapeHtml(error.message || String(error))}</div>`;
+        document.getElementById('tool-calls').innerHTML = '<div class="notice">Tool 调用加载失败</div>';
+        document.getElementById('skill-invocations').innerHTML = '<div class="notice">Skill 调用加载失败</div>';
+      }
     }
 
     document.getElementById('refresh').addEventListener('click', load);
@@ -2895,6 +3506,8 @@ def serve_dashboard(
     for config in custom_sources:
         source_keys.add(config["name"])
         source_keys.add(custom_source_key(config["name"]))
+    summary_cache: dict[tuple[str, int | None, str | None, str | None, bool], tuple[float, dict[str, Any]]] = {}
+    cache_ttl_seconds = 8.0
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: Any) -> None:
@@ -2939,13 +3552,26 @@ def serve_dashboard(
                 source = query.get("source", [default_source])[0]
                 if source not in source_keys:
                     source = default_source
-                events = load_events(source, codex_paths, opencode_paths, claude_paths, hermes_paths, local_tz, custom_sources)
+                include_details = query.get("details", [""])[0] in ("1", "true", "yes")
+                cache_key = (source, days, since, until, include_details)
+                cached = summary_cache.get(cache_key)
+                now = time.monotonic()
+                if cached and now - cached[0] <= cache_ttl_seconds:
+                    self.send_json(cached[1])
+                    return
+                events = load_events(source, codex_paths, opencode_paths, claude_paths, hermes_paths, local_tz, custom_sources, since, until)
                 events = filter_events(events, days, since, until)
-                tool_events = load_tool_events(source, codex_paths, opencode_paths, claude_paths, hermes_paths, local_tz)
-                tool_events = filter_tool_events(tool_events, days, since, until)
-                skill_events = load_skill_events(source, claude_paths, hermes_paths, local_tz, (event.cwd for event in events))
-                skill_events = filter_skill_events(skill_events, days, since, until)
-                self.send_json(summary_payload(events, prices, source, tool_events, skill_events, custom_sources))
+                if include_details:
+                    tool_events = load_tool_events(source, codex_paths, opencode_paths, claude_paths, hermes_paths, local_tz, since, until)
+                    tool_events = filter_tool_events(tool_events, days, since, until)
+                    skill_events = load_skill_events(source, claude_paths, hermes_paths, local_tz, (event.cwd for event in events), since, until)
+                    skill_events = filter_skill_events(skill_events, days, since, until)
+                else:
+                    tool_events = []
+                    skill_events = []
+                payload = summary_payload(events, prices, source, tool_events, skill_events, custom_sources, include_events=False)
+                summary_cache[cache_key] = (now, payload)
+                self.send_json(payload)
                 return
 
             self.send_response(404)
@@ -3117,11 +3743,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    events = load_events(source, codex_paths, opencode_paths, claude_paths, hermes_paths, local_tz, custom_sources)
+    events = load_events(source, codex_paths, opencode_paths, claude_paths, hermes_paths, local_tz, custom_sources, args.since, args.until)
     events = filter_events(events, args.days, args.since, args.until)
-    tool_events = load_tool_events(source, codex_paths, opencode_paths, claude_paths, hermes_paths, local_tz)
+    tool_events = load_tool_events(source, codex_paths, opencode_paths, claude_paths, hermes_paths, local_tz, args.since, args.until)
     tool_events = filter_tool_events(tool_events, args.days, args.since, args.until)
-    skill_events = load_skill_events(source, claude_paths, hermes_paths, local_tz, (event.cwd for event in events))
+    skill_events = load_skill_events(source, claude_paths, hermes_paths, local_tz, (event.cwd for event in events), args.since, args.until)
     skill_events = filter_skill_events(skill_events, args.days, args.since, args.until)
 
     if args.format == "json":

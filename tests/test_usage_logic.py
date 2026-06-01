@@ -49,6 +49,52 @@ class UsageLogicTests(unittest.TestCase):
         self.assertEqual(events[1].input_tokens, 50)
         self.assertEqual(events[1].output_tokens, 25)
 
+    def test_codex_state_sqlite_threads_are_counted_when_jsonl_has_no_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "state_5.sqlite"
+            connection = sqlite3.connect(db)
+            connection.execute(
+                """
+                CREATE TABLE threads (
+                    id TEXT,
+                    updated_at INTEGER,
+                    updated_at_ms INTEGER,
+                    created_at INTEGER,
+                    created_at_ms INTEGER,
+                    model_provider TEXT,
+                    model TEXT,
+                    cwd TEXT,
+                    tokens_used INTEGER,
+                    rollout_path TEXT
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "c1",
+                    seconds("2026-05-31T13:30:00"),
+                    None,
+                    seconds("2026-05-31T13:00:00"),
+                    None,
+                    "openai",
+                    "gpt-test",
+                    "/repo/codex",
+                    1234,
+                    "/repo/codex/session.jsonl",
+                ),
+            )
+            connection.commit()
+            connection.close()
+
+            events = usage.load_codex_state_events([Path(tmp)], UTC)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].session_id, "c1")
+        self.assertEqual(events[0].model, "openai/gpt-test")
+        self.assertEqual(events[0].hour, "2026-05-31 13:00")
+        self.assertEqual(events[0].total_tokens, 1234)
+
     def test_opencode_usage_is_attributed_to_message_time_not_session_update_time(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "opencode.db"
@@ -133,6 +179,106 @@ class UsageLogicTests(unittest.TestCase):
         self.assertEqual(events[0].hour, "2026-05-31 14:00")
         self.assertEqual(events[0].total_tokens, 157)
         self.assertEqual(events[0].api_requests, 3)
+
+    def test_hermes_tool_and_skill_events_can_use_json_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "state.db"
+            connection = sqlite3.connect(db)
+            connection.execute(
+                """
+                CREATE TABLE sessions (
+                    id TEXT,
+                    source TEXT,
+                    model TEXT,
+                    started_at REAL,
+                    ended_at REAL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE messages (
+                    id TEXT,
+                    session_id TEXT,
+                    timestamp REAL,
+                    data TEXT,
+                    tool_calls TEXT
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
+                ("h1", "hermes", "model-h", seconds("2026-05-31T12:00:00"), seconds("2026-05-31T14:00:00")),
+            )
+            connection.execute(
+                "INSERT INTO messages VALUES (?, ?, ?, ?, ?)",
+                (
+                    "m1",
+                    "h1",
+                    seconds("2026-05-31T12:30:00"),
+                    json.dumps({"tool_name": "skill", "content": "/home/me/.hermes/skills/code-review/SKILL.md"}),
+                    None,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO messages VALUES (?, ?, ?, ?, ?)",
+                ("m2", "h1", seconds("2026-05-31T12:40:00"), json.dumps({"toolName": "bash"}), None),
+            )
+            connection.execute(
+                "INSERT INTO messages VALUES (?, ?, ?, ?, ?)",
+                (
+                    "m3",
+                    "h1",
+                    seconds("2026-05-31T12:50:00"),
+                    None,
+                    json.dumps(
+                        [
+                            {"id": "call_1", "function": {"name": "terminal", "arguments": "{}"}},
+                            {"id": "call_2", "function": {"name": "skill_view", "arguments": json.dumps({"name": "debug"})}},
+                        ]
+                    ),
+                ),
+            )
+            connection.commit()
+            connection.close()
+
+            tool_events = usage.load_hermes_tool_events_from_db(db, UTC)
+            skill_events = usage.load_hermes_skill_events_from_db(db, UTC)
+
+        self.assertEqual([event.tool_name for event in tool_events], ["skill", "bash", "terminal", "skill_view"])
+        self.assertEqual(tool_events[1].skill, "命令执行")
+        self.assertEqual(len(skill_events), 2)
+        self.assertEqual(skill_events[0].skill_name, "code-review")
+        self.assertEqual(skill_events[1].skill_name, "debug")
+        self.assertEqual(skill_events[0].source_tool, "hermes")
+
+    def test_hermes_plain_assistant_messages_are_not_tool_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "state.db"
+            connection = sqlite3.connect(db)
+            connection.execute(
+                """
+                CREATE TABLE messages (
+                    id TEXT,
+                    session_id TEXT,
+                    timestamp REAL,
+                    role TEXT,
+                    data TEXT
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO messages VALUES (?, ?, ?, ?, ?)",
+                ("m1", "h1", seconds("2026-05-31T12:30:00"), "assistant", json.dumps({"content": "hello"})),
+            )
+            connection.commit()
+            connection.close()
+
+            tool_events = usage.load_hermes_tool_events_from_db(db, UTC)
+            skill_events = usage.load_hermes_skill_events_from_db(db, UTC)
+
+        self.assertEqual(tool_events, [])
+        self.assertEqual(skill_events, [])
 
     def test_settings_paths_accept_string_or_list(self) -> None:
         self.assertEqual(usage.settings_paths({"hermes_path": "~/.hermes"}, "hermes_paths", "hermes_path"), [Path("~/.hermes").expanduser()])
