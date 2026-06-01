@@ -257,6 +257,115 @@ class SkillInvocationEvent:
         return Path(self.cwd).name or self.cwd
 
 
+@dataclass(frozen=True)
+class AgentInvocationEvent:
+    timestamp: datetime
+    date: str
+    source_tool: str
+    agent_name: str
+    agent_type: str
+    invocation_type: str
+    session_id: str
+    request_id: str
+    model: str
+    cwd: str
+    source: str
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_output_tokens: int = 0
+    total_tokens: int = 0
+    calls: int = 1
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "date": self.date,
+            "hour": self.hour,
+            "source_tool": self.source_tool,
+            "agent_name": self.agent_name,
+            "agent_type": self.agent_type,
+            "invocation_type": self.invocation_type,
+            "session_id": self.session_id,
+            "request_id": self.request_id,
+            "model": self.model,
+            "cwd": self.cwd,
+            "project": self.project,
+            "source": self.source,
+            "input_tokens": self.input_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
+            "output_tokens": self.output_tokens,
+            "reasoning_output_tokens": self.reasoning_output_tokens,
+            "total_tokens": self.total_tokens,
+            "calls": self.calls,
+        }
+
+    @property
+    def hour(self) -> str:
+        return self.timestamp.strftime("%Y-%m-%d %H:00")
+
+    @property
+    def project(self) -> str:
+        if not self.cwd:
+            return "(unknown)"
+        return Path(self.cwd).name or self.cwd
+
+
+@dataclass(frozen=True)
+class AppUsageEvent:
+    timestamp: datetime
+    date: str
+    app_type: str
+    provider_id: str
+    provider_name: str
+    provider_type: str
+    model: str
+    request_model: str
+    status_code: int
+    data_source: str
+    session_id: str
+    source: str
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_output_tokens: int = 0
+    total_tokens: int = 0
+    api_requests: int = 1
+    success_count: int = 0
+    cost_usd: float = 0.0
+    latency_ms: int = 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "date": self.date,
+            "hour": self.hour,
+            "app_type": self.app_type,
+            "provider_id": self.provider_id,
+            "provider_name": self.provider_name,
+            "provider_type": self.provider_type,
+            "model": self.model,
+            "request_model": self.request_model,
+            "status_code": self.status_code,
+            "data_source": self.data_source,
+            "session_id": self.session_id,
+            "source": self.source,
+            "input_tokens": self.input_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
+            "output_tokens": self.output_tokens,
+            "reasoning_output_tokens": self.reasoning_output_tokens,
+            "total_tokens": self.total_tokens,
+            "api_requests": self.api_requests,
+            "success_count": self.success_count,
+            "cost_usd": round(self.cost_usd, 6),
+            "latency_ms": self.latency_ms,
+        }
+
+    @property
+    def hour(self) -> str:
+        return self.timestamp.strftime("%Y-%m-%d %H:00")
+
+
 def parse_timestamp(value: str, local_tz: ZoneInfo) -> datetime:
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
@@ -291,7 +400,25 @@ def safe_int(value: Any) -> int:
         return 0
     if isinstance(value, (int, float)):
         return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value))
+        except ValueError:
+            return 0
     return 0
+
+
+def safe_float(value: Any) -> float:
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
 def token_map(value: Any) -> dict[str, int]:
@@ -309,6 +436,68 @@ def split_usage_evenly(usage: dict[str, int], parts: int) -> list[dict[str, int]
         for index in range(remainder):
             split[index][field] += 1
     return split
+
+
+def normalized_agent_name(value: Any, fallback: str = "default") -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return fallback
+
+
+def agent_name_from_arguments(arguments: Any, fallback: str = "task") -> str:
+    arguments = parse_json_maybe(arguments)
+    if isinstance(arguments, dict):
+        for key in ("subagent_type", "subagentType", "agent_type", "agentType", "agent", "agent_name", "agentName", "name"):
+            value = arguments.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return fallback
+
+
+def looks_like_agent_tool(tool_name: str) -> bool:
+    normalized = tool_name.strip().lower()
+    return normalized in {"task", "agent", "subagent"} or "agent" in normalized
+
+
+def agent_type_for_tool(tool_name: str, arguments: Any = None) -> str:
+    normalized = tool_name.strip().lower()
+    args = parse_json_maybe(arguments)
+    if isinstance(args, dict) and first_string(args.get("subagent_type"), args.get("subagentType")):
+        return "subagent"
+    if "subagent" in normalized:
+        return "subagent"
+    if normalized == "task":
+        return "task-agent"
+    return "agent"
+
+
+def agent_events_from_tool_events(events: Iterable[ToolCallEvent], invocation_type: str = "tool_call") -> list[AgentInvocationEvent]:
+    output: list[AgentInvocationEvent] = []
+    for event in events:
+        if not looks_like_agent_tool(event.tool_name):
+            continue
+        output.append(
+            AgentInvocationEvent(
+                timestamp=event.timestamp,
+                date=event.date,
+                source_tool=event.source_tool,
+                agent_name=agent_name_from_arguments({}, event.tool_name),
+                agent_type=agent_type_for_tool(event.tool_name),
+                invocation_type=invocation_type,
+                session_id=event.session_id,
+                request_id=event.request_id,
+                model=event.model,
+                cwd=event.cwd,
+                source=event.source,
+                input_tokens=event.input_tokens,
+                cached_input_tokens=event.cached_input_tokens,
+                output_tokens=event.output_tokens,
+                reasoning_output_tokens=event.reasoning_output_tokens,
+                total_tokens=event.total_tokens,
+                calls=event.calls,
+            )
+        )
+    return output
 
 
 def skill_for_tool(tool_name: str) -> str:
@@ -593,6 +782,32 @@ def text_from_claude_message(message: dict[str, Any]) -> str:
     return ""
 
 
+def estimate_tokens_from_text(text: str) -> int:
+    """Return a conservative local fallback estimate when a log stores zero usage.
+
+    Claude Code can write zero token counts when a local Anthropic-compatible
+    proxy drops streaming usage metadata. The original billable token count is
+    not recoverable from the transcript alone, but showing a conservative
+    estimate is more useful than an all-zero dashboard.
+    """
+    if not text:
+        return 0
+    # Mixed Chinese/English/code content is commonly around 3-4 chars/token.
+    return max(1, round(len(text) / 3.5))
+
+
+def claude_fallback_usage(message: dict[str, Any], prompt_text: str = "") -> dict[str, int]:
+    input_tokens = estimate_tokens_from_text(prompt_text)
+    output_tokens = estimate_tokens_from_text(text_from_claude_message(message))
+    return {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": 0,
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": 0,
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+
 def opencode_model_name(value: Any) -> str:
     if not value:
         return "unknown"
@@ -652,6 +867,22 @@ def claude_usage_map(value: Any) -> dict[str, int]:
         "reasoning_output_tokens": reasoning_output_tokens,
         "total_tokens": total_tokens,
     }
+
+
+def claude_usage_present(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return any(
+        key in value
+        for key in (
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+            "total_tokens",
+        )
+    )
 
 
 def subtract_usage(current: dict[str, int], previous: dict[str, int]) -> dict[str, int]:
@@ -795,6 +1026,10 @@ def default_claude_paths() -> list[Path]:
 
 def default_hermes_paths() -> list[Path]:
     return existing_or_all([Path("~/.hermes"), *app_data_candidates("hermes"), *wsl_hermes_paths()])
+
+
+def default_ccswitch_paths() -> list[Path]:
+    return existing_or_all([Path("~/.cc-switch/cc-switch.db")])
 
 
 def wsl_hermes_paths() -> list[Path]:
@@ -1134,6 +1369,144 @@ def load_codex_tool_events(
     return sorted(events, key=lambda event: event.timestamp)
 
 
+def codex_call_arguments(payload: dict[str, Any]) -> Any:
+    arguments = payload.get("arguments") or payload.get("input") or payload.get("params")
+    if arguments is not None:
+        return parse_json_maybe(arguments)
+    call = payload.get("call")
+    if isinstance(call, dict):
+        return parse_json_maybe(call.get("arguments") or call.get("input") or call.get("params"))
+    return None
+
+
+def parse_codex_agent_log(path: Path, local_tz: ZoneInfo) -> Iterable[AgentInvocationEvent]:
+    session_id = session_id_from_path(path)
+    model = "unknown"
+    cwd = ""
+    pending_agents: list[tuple[str, str, str, str]] = []
+    previous_total = {field: 0 for field in TOKEN_FIELDS}
+
+    try:
+        lines = path.open("r", encoding="utf-8", errors="replace")
+    except OSError as exc:
+        print(f"warning: cannot read {path}: {exc}", file=sys.stderr)
+        return
+
+    with lines:
+        for line_number, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = item.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            timestamp_raw = item.get("timestamp")
+            try:
+                timestamp = parse_timestamp(timestamp_raw, local_tz) if isinstance(timestamp_raw, str) else None
+            except ValueError:
+                timestamp = None
+            if item.get("type") == "session_meta":
+                session_id = str(payload.get("id") or session_id)
+                continue
+            if item.get("type") == "turn_context":
+                model = str(payload.get("model") or model)
+                cwd = str(payload.get("cwd") or cwd)
+                mode = payload.get("collaboration_mode")
+                agent_name = first_string(
+                    payload.get("collaboration_mode_kind"),
+                    mode.get("mode") if isinstance(mode, dict) else None,
+                    "default",
+                )
+                if timestamp:
+                    yield AgentInvocationEvent(
+                        timestamp=timestamp,
+                        date=timestamp.date().isoformat(),
+                        source_tool="codex",
+                        agent_name=agent_name,
+                        agent_type="agent",
+                        invocation_type="turn_context",
+                        session_id=session_id,
+                        request_id=first_string(payload.get("turn_id"), f"{path.stem}:{line_number}"),
+                        model=model,
+                        cwd=cwd,
+                        source=str(path),
+                    )
+                continue
+            payload_type = str(payload.get("type") or "")
+            if payload_type in ("function_call", "custom_tool_call", "mcp_tool_call_end"):
+                tool_name = first_string(payload.get("name"), payload.get("tool"), payload_type)
+                if looks_like_agent_tool(tool_name):
+                    args = codex_call_arguments(payload)
+                    pending_agents.append(
+                        (
+                            agent_name_from_arguments(args, tool_name),
+                            agent_type_for_tool(tool_name, args),
+                            "tool_call",
+                            first_string(payload.get("call_id"), payload.get("id"), f"{path.stem}:{line_number}"),
+                        )
+                    )
+                continue
+            if payload_type == "agent_message" and timestamp:
+                yield AgentInvocationEvent(
+                    timestamp=timestamp,
+                    date=timestamp.date().isoformat(),
+                    source_tool="codex",
+                    agent_name="default",
+                    agent_type="agent",
+                    invocation_type="agent_message",
+                    session_id=session_id,
+                    request_id=f"{path.stem}:{line_number}",
+                    model=model,
+                    cwd=cwd,
+                    source=str(path),
+                )
+                continue
+            if payload_type != "token_count":
+                continue
+            info = payload.get("info")
+            if not isinstance(info, dict):
+                continue
+            current_total = token_map(info.get("total_token_usage"))
+            has_current_total = any(current_total.values())
+            delta = subtract_usage(current_total, previous_total)
+            if not has_current_total or any(value < 0 for value in delta.values()):
+                delta = token_map(info.get("last_token_usage"))
+            if has_current_total:
+                previous_total = current_total
+            if not timestamp or not pending_agents:
+                pending_agents = []
+                continue
+            agents = pending_agents
+            pending_agents = []
+            for (agent_name, agent_type, invocation_type, request_id), usage in zip(agents, split_usage_evenly(delta, len(agents))):
+                yield AgentInvocationEvent(
+                    timestamp=timestamp,
+                    date=timestamp.date().isoformat(),
+                    source_tool="codex",
+                    agent_name=agent_name,
+                    agent_type=agent_type,
+                    invocation_type=invocation_type,
+                    session_id=session_id,
+                    request_id=request_id,
+                    model=model,
+                    cwd=cwd,
+                    source=str(path),
+                    **usage,
+                )
+
+
+def load_codex_agent_events(
+    paths: list[Path], local_tz: ZoneInfo, since: str | None = None, until: str | None = None
+) -> list[AgentInvocationEvent]:
+    events: list[AgentInvocationEvent] = []
+    for log in discover_logs(paths, since, until, local_tz):
+        events.extend(parse_codex_agent_log(log, local_tz))
+    return sorted(events, key=lambda event: event.timestamp)
+
+
 def discover_opencode_dbs(paths: list[Path]) -> list[Path]:
     dbs: list[Path] = []
     for path in paths:
@@ -1246,6 +1619,140 @@ def load_opencode_tool_events_from_db(path: Path, local_tz: ZoneInfo) -> list[To
                 )
             )
     return sorted(events, key=lambda event: event.timestamp)
+
+
+def load_opencode_agent_events_from_db(path: Path, local_tz: ZoneInfo) -> list[AgentInvocationEvent]:
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        print(f"warning: cannot open OpenCode database {path}: {exc}", file=sys.stderr)
+        return []
+
+    query = """
+        SELECT
+            m.id,
+            m.session_id,
+            json_extract(m.data, '$.time.completed'),
+            json_extract(m.data, '$.time.created'),
+            json_extract(m.data, '$.modelID'),
+            json_extract(m.data, '$.providerID'),
+            json_extract(m.data, '$.path.cwd'),
+            json_extract(m.data, '$.tokens.input'),
+            json_extract(m.data, '$.tokens.cache.read'),
+            json_extract(m.data, '$.tokens.cache.write'),
+            json_extract(m.data, '$.tokens.output'),
+            json_extract(m.data, '$.tokens.reasoning'),
+            json_extract(m.data, '$.tokens.total'),
+            json_extract(p.data, '$.tool'),
+            p.data
+        FROM message m
+        JOIN part p ON p.message_id = m.id
+        WHERE json_extract(m.data, '$.role') = 'assistant'
+          AND json_extract(p.data, '$.type') = 'tool'
+          AND json_extract(p.data, '$.tool') IS NOT NULL
+        ORDER BY m.time_updated, m.id, p.id
+    """
+    events: list[AgentInvocationEvent] = []
+    try:
+        rows = list(connection.execute(query))
+    except sqlite3.Error as exc:
+        print(f"warning: cannot read OpenCode agent events {path}: {exc}", file=sys.stderr)
+        return []
+    finally:
+        connection.close()
+    grouped_counts: dict[str, int] = defaultdict(int)
+    for row in rows:
+        (
+            message_id,
+            session_id,
+            completed_at,
+            created_at,
+            model_id,
+            provider_id,
+            cwd,
+            input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            output_tokens,
+            reasoning_tokens,
+            total_tokens,
+            tool_name,
+            part_data,
+        ) = row
+        tool = str(tool_name or "unknown")
+        if not looks_like_agent_tool(tool):
+            continue
+        part = parse_json_maybe(part_data)
+        args: Any = part if isinstance(part, dict) else {}
+        if isinstance(args, dict):
+            args = args.get("input") or args.get("arguments") or args.get("params") or args
+        timestamp_raw = completed_at or created_at
+        if timestamp_raw is None:
+            continue
+        try:
+            timestamp = parse_epoch_millis(timestamp_raw, local_tz)
+        except Exception:
+            continue
+        usage = {
+            "input_tokens": safe_int(input_tokens),
+            "cached_input_tokens": safe_int(cache_read_tokens) + safe_int(cache_write_tokens),
+            "output_tokens": safe_int(output_tokens),
+            "reasoning_output_tokens": safe_int(reasoning_tokens),
+            "total_tokens": safe_int(total_tokens),
+        }
+        grouped_counts[str(message_id)] += 1
+        model = f"{provider_id}/{model_id}" if provider_id else str(model_id or "unknown")
+        events.append(
+            AgentInvocationEvent(
+                timestamp=timestamp,
+                date=timestamp.date().isoformat(),
+                source_tool="opencode",
+                agent_name=agent_name_from_arguments(args, tool),
+                agent_type=agent_type_for_tool(tool, args),
+                invocation_type="tool_call",
+                session_id=str(session_id),
+                request_id=str(message_id),
+                model=model,
+                cwd=str(cwd or ""),
+                source=str(path),
+                **usage,
+            )
+        )
+    # If several agent tools are attached to the same assistant message, split
+    # the message-level token usage across them to avoid double-counting.
+    output: list[AgentInvocationEvent] = []
+    for event in events:
+        parts = max(1, grouped_counts[event.request_id])
+        if parts == 1:
+            output.append(event)
+            continue
+        split = {field: getattr(event, field) // parts for field in TOKEN_FIELDS}
+        output.append(
+            AgentInvocationEvent(
+                timestamp=event.timestamp,
+                date=event.date,
+                source_tool=event.source_tool,
+                agent_name=event.agent_name,
+                agent_type=event.agent_type,
+                invocation_type=event.invocation_type,
+                session_id=event.session_id,
+                request_id=event.request_id,
+                model=event.model,
+                cwd=event.cwd,
+                source=event.source,
+                **split,
+            )
+        )
+    return sorted(output, key=lambda event: event.timestamp)
+
+
+def load_opencode_agent_events(
+    paths: list[Path], local_tz: ZoneInfo, since: str | None = None, until: str | None = None
+) -> list[AgentInvocationEvent]:
+    events: list[AgentInvocationEvent] = []
+    for db in discover_opencode_dbs(paths):
+        events.extend(load_opencode_agent_events_from_db(db, local_tz))
+    return filter_agent_events(events, None, since, until)
 
 
 def parse_opencode_db(path: Path, local_tz: ZoneInfo) -> Iterable[UsageEvent]:
@@ -1677,6 +2184,7 @@ def parse_claude_log(path: Path, local_tz: ZoneInfo) -> Iterable[UsageEvent]:
     session_id = path.stem
     model = "unknown"
     cwd = ""
+    last_user_text = ""
 
     try:
         lines = path.open("r", encoding="utf-8", errors="replace")
@@ -1716,12 +2224,18 @@ def parse_claude_log(path: Path, local_tz: ZoneInfo) -> Iterable[UsageEvent]:
                 cwd,
             )
 
+            role = first_string(item.get("role"), message.get("role"), item.get("type"))
+            if role == "user":
+                last_user_text = text_from_claude_message(message) or first_string(item.get("text"), item.get("content"))
+
             usage = item.get("usage")
             if not isinstance(usage, dict):
                 usage = message.get("usage")
             delta = claude_usage_map(usage)
-            if all(delta[field] == 0 for field in TOKEN_FIELDS):
+            if all(delta[field] == 0 for field in TOKEN_FIELDS) and not claude_usage_present(usage):
                 continue
+            if all(delta[field] == 0 for field in TOKEN_FIELDS):
+                delta = claude_fallback_usage(message, last_user_text)
 
             timestamp_raw = first_string(
                 item.get("timestamp"),
@@ -1778,6 +2292,16 @@ def claude_tool_names_from_item(item: dict[str, Any]) -> list[str]:
     return tools
 
 
+def claude_tool_parts_from_item(item: dict[str, Any]) -> list[dict[str, Any]]:
+    message = item.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    return [part for part in content if isinstance(part, dict) and part.get("type") in ("tool_use", "server_tool_use")]
+
+
 def parse_claude_tool_log(path: Path, local_tz: ZoneInfo) -> Iterable[ToolCallEvent]:
     session_id = path.stem
     model = "unknown"
@@ -1809,7 +2333,7 @@ def parse_claude_tool_log(path: Path, local_tz: ZoneInfo) -> Iterable[ToolCallEv
             if not isinstance(usage, dict):
                 usage = message.get("usage")
             delta = claude_usage_map(usage)
-            if all(delta[field] == 0 for field in TOKEN_FIELDS):
+            if all(delta[field] == 0 for field in TOKEN_FIELDS) and not claude_usage_present(usage):
                 continue
             tools = claude_tool_names_from_item(item)
             if not tools:
@@ -1843,6 +2367,77 @@ def load_claude_tool_events(
     events: list[ToolCallEvent] = []
     for log in discover_claude_logs(paths, since, until, local_tz):
         events.extend(parse_claude_tool_log(log, local_tz))
+    return sorted(events, key=lambda event: event.timestamp)
+
+
+def parse_claude_agent_log(path: Path, local_tz: ZoneInfo) -> Iterable[AgentInvocationEvent]:
+    session_id = path.stem
+    model = "unknown"
+    cwd = ""
+    try:
+        lines = path.open("r", encoding="utf-8", errors="replace")
+    except OSError as exc:
+        print(f"warning: cannot read {path}: {exc}", file=sys.stderr)
+        return
+    with lines:
+        for line_number, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(item, dict):
+                continue
+            message = item.get("message")
+            if not isinstance(message, dict):
+                message = {}
+            session_id = first_string(
+                item.get("sessionId"), item.get("session_id"), item.get("sessionID"), item.get("uuid"), item.get("id"), session_id
+            )
+            model = first_string(item.get("model"), message.get("model"), model) or "unknown"
+            cwd = first_string(item.get("cwd"), item.get("projectPath"), item.get("project_path"), cwd)
+            parts = [part for part in claude_tool_parts_from_item(item) if looks_like_agent_tool(first_string(part.get("name"), part.get("tool"), part.get("tool_name")))]
+            if not parts:
+                continue
+            usage = item.get("usage")
+            if not isinstance(usage, dict):
+                usage = message.get("usage")
+            delta = claude_usage_map(usage)
+            if all(delta[field] == 0 for field in TOKEN_FIELDS):
+                delta = claude_fallback_usage(message)
+            timestamp_raw = first_string(item.get("timestamp"), item.get("created_at"), item.get("createdAt"))
+            if not timestamp_raw:
+                continue
+            try:
+                timestamp = parse_timestamp(timestamp_raw, local_tz)
+            except ValueError:
+                continue
+            for index, (part, split) in enumerate(zip(parts, split_usage_evenly(delta, len(parts))), 1):
+                tool_name = first_string(part.get("name"), part.get("tool"), part.get("tool_name"), "Task")
+                args = part.get("input") or part.get("arguments") or part.get("params") or {}
+                yield AgentInvocationEvent(
+                    timestamp=timestamp,
+                    date=timestamp.date().isoformat(),
+                    source_tool="claude",
+                    agent_name=agent_name_from_arguments(args, tool_name),
+                    agent_type=agent_type_for_tool(tool_name, args),
+                    invocation_type="tool_use",
+                    session_id=session_id,
+                    request_id=first_string(part.get("id"), f"{session_id}:{line_number}:{index}"),
+                    model=model,
+                    cwd=cwd,
+                    source=str(path),
+                    **split,
+                )
+
+
+def load_claude_agent_events(
+    paths: list[Path], local_tz: ZoneInfo, since: str | None = None, until: str | None = None
+) -> list[AgentInvocationEvent]:
+    events: list[AgentInvocationEvent] = []
+    for log in discover_claude_logs(paths, since, until, local_tz):
+        events.extend(parse_claude_agent_log(log, local_tz))
     return sorted(events, key=lambda event: event.timestamp)
 
 
@@ -2094,6 +2689,195 @@ def filter_skill_events(
     return filtered
 
 
+def filter_agent_events(
+    events: list[AgentInvocationEvent], days: int | None, since: str | None, until: str | None
+) -> list[AgentInvocationEvent]:
+    if not events:
+        return []
+    filtered = sorted(events, key=lambda event: event.timestamp)
+    if days is not None:
+        last_date = datetime.fromisoformat(filtered[-1].date).date()
+        first_date = last_date - timedelta(days=days - 1)
+        filtered = [event for event in filtered if first_date.isoformat() <= event.date <= last_date.isoformat()]
+    if since:
+        filtered = [event for event in filtered if event.date >= since]
+    if until:
+        filtered = [event for event in filtered if event.date <= until]
+    return filtered
+
+
+def load_agent_events(
+    source: str,
+    codex_paths: list[Path],
+    opencode_paths: list[Path],
+    claude_paths: list[Path],
+    hermes_paths: list[Path],
+    local_tz: ZoneInfo,
+    since: str | None = None,
+    until: str | None = None,
+) -> list[AgentInvocationEvent]:
+    events: list[AgentInvocationEvent] = []
+    if source in ("codex", "all"):
+        events.extend(load_codex_agent_events(codex_paths, local_tz, since, until))
+    if source in ("opencode", "all"):
+        events.extend(load_opencode_agent_events(opencode_paths, local_tz, since, until))
+    if source in ("claude", "all"):
+        events.extend(load_claude_agent_events(claude_paths, local_tz, since, until))
+    if source in ("hermes", "all"):
+        tool_events = load_hermes_tool_events(hermes_paths, local_tz)
+        events.extend(agent_events_from_tool_events(tool_events, "tool_call"))
+    return filter_agent_events(events, None, since, until)
+
+
+def discover_ccswitch_dbs(paths: list[Path]) -> list[Path]:
+    candidates: list[Path] = []
+    for path in paths:
+        expanded = path.expanduser()
+        if expanded.is_file():
+            candidates.append(expanded)
+        elif expanded.is_dir():
+            candidates.append(expanded / "cc-switch.db")
+    return [path for path in unique_paths(candidates) if path.is_file()]
+
+
+def load_ccswitch_provider_map(path: Path) -> dict[tuple[str, str], dict[str, str]]:
+    output: dict[tuple[str, str], dict[str, str]] = {}
+    try:
+        with sqlite3.connect(path) as connection:
+            if not sqlite_table_columns(connection, "providers"):
+                return output
+            columns = sqlite_table_columns(connection, "providers")
+            provider_type_expr = sqlite_column_expr("p", columns, ("provider_type", "category"), "provider_type")
+            query = f"""
+                SELECT p.app_type, p.id, p.name, {provider_type_expr}, p.is_current
+                FROM providers p
+            """
+            for app_type, provider_id, name, provider_type, is_current in connection.execute(query):
+                output[(str(app_type or "unknown"), str(provider_id or ""))] = {
+                    "provider_name": str(name or provider_id or "unknown"),
+                    "provider_type": str(provider_type or ""),
+                    "is_current": "1" if safe_int(is_current) else "0",
+                }
+    except sqlite3.Error as exc:
+        print(f"warning: cannot read CC Switch providers {path}: {exc}", file=sys.stderr)
+    return output
+
+
+def load_ccswitch_app_usage_events(paths: list[Path], local_tz: ZoneInfo, since: str | None = None, until: str | None = None) -> list[AppUsageEvent]:
+    events: list[AppUsageEvent] = []
+    for path in discover_ccswitch_dbs(paths):
+        provider_map = load_ccswitch_provider_map(path)
+        try:
+            with sqlite3.connect(path) as connection:
+                columns = sqlite_table_columns(connection, "proxy_request_logs")
+                if not columns:
+                    continue
+                request_model_expr = sqlite_column_expr("r", columns, ("request_model",), "request_model")
+                session_expr = sqlite_column_expr("r", columns, ("session_id",), "session_id")
+                data_source_expr = sqlite_column_expr("r", columns, ("data_source",), "data_source")
+                provider_type_expr = sqlite_column_expr("r", columns, ("provider_type",), "provider_type")
+                cache_read_expr = sqlite_column_expr("r", columns, ("cache_read_tokens",), "cache_read_tokens")
+                cache_creation_expr = sqlite_column_expr("r", columns, ("cache_creation_tokens",), "cache_creation_tokens")
+                total_cost_expr = sqlite_column_expr("r", columns, ("total_cost_usd",), "total_cost_usd")
+                latency_expr = sqlite_column_expr("r", columns, ("latency_ms",), "latency_ms")
+                status_expr = sqlite_column_expr("r", columns, ("status_code",), "status_code")
+                query = f"""
+                    SELECT r.created_at, r.app_type, r.provider_id, r.model,
+                           {request_model_expr}, {session_expr}, {data_source_expr}, {provider_type_expr},
+                           r.input_tokens, r.output_tokens, {cache_read_expr}, {cache_creation_expr},
+                           {total_cost_expr}, {latency_expr}, {status_expr}
+                    FROM proxy_request_logs r
+                    ORDER BY r.created_at
+                """
+                for row in connection.execute(query):
+                    (
+                        created_at,
+                        app_type,
+                        provider_id,
+                        model,
+                        request_model,
+                        session_id,
+                        data_source,
+                        provider_type,
+                        input_tokens,
+                        output_tokens,
+                        cache_read_tokens,
+                        cache_creation_tokens,
+                        total_cost_usd,
+                        latency_ms,
+                        status_code,
+                    ) = row
+                    timestamp = parse_epoch_millis(created_at, local_tz) if safe_int(created_at) > 10_000_000_000 else parse_epoch_seconds(created_at, local_tz)
+                    date = timestamp.date().isoformat()
+                    if since and date < since:
+                        continue
+                    if until and date > until:
+                        continue
+                    app = str(app_type or "unknown")
+                    pid = str(provider_id or "")
+                    provider = provider_map.get((app, pid), {})
+                    cached_tokens = safe_int(cache_read_tokens) + safe_int(cache_creation_tokens)
+                    in_tokens = safe_int(input_tokens)
+                    out_tokens = safe_int(output_tokens)
+                    cached_total = cached_tokens
+                    total_tokens = in_tokens + out_tokens + cached_total
+                    events.append(
+                        AppUsageEvent(
+                            timestamp=timestamp,
+                            date=date,
+                            app_type=app,
+                            provider_id=pid,
+                            provider_name=provider.get("provider_name") or pid or "unknown",
+                            provider_type=str(provider_type or provider.get("provider_type") or ""),
+                            model=str(model or "unknown"),
+                            request_model=str(request_model or model or "unknown"),
+                            status_code=safe_int(status_code),
+                            data_source=str(data_source or "proxy"),
+                            session_id=str(session_id or ""),
+                            source=str(path),
+                            input_tokens=in_tokens,
+                            cached_input_tokens=cached_total,
+                            output_tokens=out_tokens,
+                            total_tokens=total_tokens,
+                            api_requests=1,
+                            success_count=1 if 200 <= safe_int(status_code) < 400 else 0,
+                            cost_usd=safe_float(total_cost_usd),
+                            latency_ms=safe_int(latency_ms),
+                        )
+                    )
+        except sqlite3.Error as exc:
+            print(f"warning: cannot read CC Switch usage {path}: {exc}", file=sys.stderr)
+    return sorted(events, key=lambda event: event.timestamp)
+
+
+def filter_ccswitch_events_by_source(events: list[AppUsageEvent], source: str) -> list[AppUsageEvent]:
+    if source in ("all", "custom") or source.startswith("custom:"):
+        return events
+    aliases = {
+        "claude": ("claude", "claude-code", "claude_code", "claudecode"),
+        "codex": ("codex", "openai-codex", "openai_codex"),
+        "opencode": ("opencode", "open-code", "open_code"),
+        "hermes": ("hermes", "hermes-agent", "hermes_agent"),
+    }.get(source, (source,))
+    alias_set = {alias.lower() for alias in aliases}
+    return [event for event in events if event.app_type.lower() in alias_set]
+
+
+def filter_app_usage_events(events: list[AppUsageEvent], days: int | None, since: str | None, until: str | None) -> list[AppUsageEvent]:
+    if not events:
+        return []
+    filtered = sorted(events, key=lambda event: event.timestamp)
+    if days is not None:
+        last_date = datetime.fromisoformat(filtered[-1].date).date()
+        first_date = last_date - timedelta(days=days - 1)
+        filtered = [event for event in filtered if first_date.isoformat() <= event.date <= last_date.isoformat()]
+    if since:
+        filtered = [event for event in filtered if event.date >= since]
+    if until:
+        filtered = [event for event in filtered if event.date <= until]
+    return filtered
+
+
 def load_tool_events(
     source: str,
     codex_paths: list[Path],
@@ -2300,6 +3084,7 @@ def output_doctor(
     opencode_paths: list[Path],
     claude_paths: list[Path],
     hermes_paths: list[Path],
+    ccswitch_paths: list[Path],
     price_config: Path | None,
     custom_sources: list[dict[str, Any]] | None = None,
 ) -> None:
@@ -2317,6 +3102,7 @@ def output_doctor(
     opencode_dbs = discover_opencode_dbs(opencode_paths)
     claude_logs = discover_claude_logs(claude_paths)
     hermes_dbs = discover_hermes_dbs(hermes_paths)
+    ccswitch_dbs = discover_ccswitch_dbs(ccswitch_paths)
 
     print_path_status(
         "Codex",
@@ -2327,6 +3113,7 @@ def output_doctor(
     print_path_status("OpenCode", opencode_paths, opencode_dbs, len(load_opencode_events(opencode_paths, local_tz)) if opencode_dbs else 0)
     print_path_status("Claude Code", claude_paths, claude_logs, len(load_claude_events(claude_paths, local_tz)) if claude_logs else 0)
     print_path_status("Hermes", hermes_paths, hermes_dbs, len(load_hermes_events(hermes_paths, local_tz)) if hermes_dbs else 0)
+    print_path_status("CC Switch", ccswitch_paths, ccswitch_dbs, len(load_ccswitch_app_usage_events(ccswitch_paths, local_tz)) if ccswitch_dbs else 0)
     for config in custom_sources or []:
         logs = discover_logs(config["paths"])
         print_path_status(
@@ -2336,7 +3123,7 @@ def output_doctor(
             len(load_custom_source_events(config, local_tz)) if logs else 0,
         )
 
-    if not any((codex_logs, codex_dbs, opencode_dbs, claude_logs, hermes_dbs)):
+    if not any((codex_logs, codex_dbs, opencode_dbs, claude_logs, hermes_dbs, ccswitch_dbs)):
         print("\nNo data sources were found. Create ai-token-usage.json or pass --*-path flags to point to your app data.")
     print("\nNotes:")
     print("  - Codex/OpenCode/Claude Code hourly charts use event/message/usage-record timestamps.")
@@ -2426,6 +3213,79 @@ def tool_rollup(events: Iterable[ToolCallEvent], key_fields: tuple[str, ...]) ->
             str(row.get("tool_name", "")),
             str(row.get("skill_name", "")),
         ),
+        reverse=True,
+    )
+
+
+def agent_rollup(events: Iterable[AgentInvocationEvent], key_fields: tuple[str, ...]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    sessions: dict[tuple[Any, ...], set[str]] = defaultdict(set)
+    requests: dict[tuple[Any, ...], set[str]] = defaultdict(set)
+    calls: dict[tuple[Any, ...], int] = defaultdict(int)
+    for event in events:
+        key = tuple(getattr(event, field) for field in key_fields)
+        if key not in grouped:
+            grouped[key] = {field: getattr(event, field) for field in key_fields}
+            for token_field in TOKEN_FIELDS:
+                grouped[key][token_field] = 0
+        for token_field in TOKEN_FIELDS:
+            grouped[key][token_field] += getattr(event, token_field)
+        sessions[key].add(event.session_id)
+        requests[key].add(event.request_id)
+        calls[key] += event.calls
+    rows = []
+    for key, row in grouped.items():
+        row["calls"] = calls[key]
+        row["api_requests"] = len(requests[key])
+        row["sessions"] = len(sessions[key])
+        rows.append(row)
+    return sorted(
+        rows,
+        key=lambda row: (
+            row.get("calls", 0),
+            row.get("api_requests", 0),
+            row.get("total_tokens", 0),
+            str(row.get("source_tool", "")),
+            str(row.get("agent_name", "")),
+        ),
+        reverse=True,
+    )
+
+
+def app_usage_rollup(events: Iterable[AppUsageEvent], key_fields: tuple[str, ...]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    sessions: dict[tuple[Any, ...], set[str]] = defaultdict(set)
+    for event in events:
+        key = tuple(getattr(event, field) for field in key_fields)
+        if key not in grouped:
+            grouped[key] = {field: getattr(event, field) for field in key_fields}
+            for token_field in TOKEN_FIELDS:
+                grouped[key][token_field] = 0
+            grouped[key]["api_requests"] = 0
+            grouped[key]["success_count"] = 0
+            grouped[key]["cost_usd"] = 0.0
+            grouped[key]["latency_ms_total"] = 0
+        row = grouped[key]
+        for token_field in TOKEN_FIELDS:
+            row[token_field] += getattr(event, token_field)
+        row["api_requests"] += event.api_requests
+        row["success_count"] += event.success_count
+        row["cost_usd"] += event.cost_usd
+        row["latency_ms_total"] += event.latency_ms
+        if event.session_id:
+            sessions[key].add(event.session_id)
+    rows = []
+    for key, row in grouped.items():
+        requests = row.get("api_requests", 0) or 0
+        row["calls"] = requests
+        row["sessions"] = len(sessions[key])
+        row["success_rate"] = round((row.get("success_count", 0) / requests * 100) if requests else 0.0, 2)
+        row["avg_latency_ms"] = round((row.pop("latency_ms_total", 0) / requests) if requests else 0)
+        row["cost_usd"] = round(row.get("cost_usd", 0.0), 6)
+        rows.append(row)
+    return sorted(
+        rows,
+        key=lambda row: (row.get("total_tokens", 0), row.get("api_requests", 0), row.get("cost_usd", 0.0)),
         reverse=True,
     )
 
@@ -2531,9 +3391,13 @@ def output_text(
     prices: dict[str, dict[str, float]],
     tool_events: list[ToolCallEvent] | None = None,
     skill_events: list[SkillInvocationEvent] | None = None,
+    agent_events: list[AgentInvocationEvent] | None = None,
+    app_usage_events: list[AppUsageEvent] | None = None,
 ) -> None:
     tool_events = tool_events or []
     skill_events = skill_events or []
+    agent_events = agent_events or []
+    app_usage_events = app_usage_events or []
     total = totals(events, prices)
     print("AI token usage")
     print(f"API requests: {total['api_requests']:,}")
@@ -2588,6 +3452,21 @@ def output_text(
         tool_rollup(skill_events, ("source_tool", "skill_name", "skill_source", "plugin_name", "invocation_type"))[:20],
         ["source_tool", "skill_name", "skill_source", "plugin_name", "invocation_type", "calls", "api_requests", "sessions"],
     )
+    print_table(
+        "By agent",
+        agent_rollup(agent_events, ("source_tool", "agent_name", "agent_type"))[:20],
+        ["source_tool", "agent_name", "agent_type", "calls", "api_requests", "sessions", "total_tokens", "input_tokens", "output_tokens"],
+    )
+    print_table(
+        "By agent invocation",
+        agent_rollup(agent_events, ("source_tool", "agent_name", "agent_type", "invocation_type"))[:20],
+        ["source_tool", "agent_name", "agent_type", "invocation_type", "calls", "api_requests", "sessions", "total_tokens"],
+    )
+    print_table(
+        "By application provider",
+        app_usage_rollup(app_usage_events, ("app_type", "provider_name", "provider_type", "model"))[:20],
+        ["app_type", "provider_name", "provider_type", "model", "api_requests", "success_rate", "total_tokens", "input_tokens", "cached_input_tokens", "output_tokens", "cost_usd"],
+    )
 
 
 def summary_payload(
@@ -2596,11 +3475,18 @@ def summary_payload(
     source: str = "codex",
     tool_events: list[ToolCallEvent] | None = None,
     skill_events: list[SkillInvocationEvent] | None = None,
+    agent_events: list[AgentInvocationEvent] | None = None,
+    app_usage_events: list[AppUsageEvent] | None = None,
     custom_sources: list[dict[str, Any]] | None = None,
     include_events: bool = True,
 ) -> dict[str, Any]:
+    if custom_sources is None and app_usage_events and all(isinstance(item, dict) for item in app_usage_events):
+        custom_sources = app_usage_events  # backwards-compatible positional argument from older callers
+        app_usage_events = []
     tool_events = tool_events or []
     skill_events = skill_events or []
+    agent_events = agent_events or []
+    app_usage_events = app_usage_events or []
     by_tool_category = tool_rollup(tool_events, ("source_tool", "skill"))
     payload = {
         "source": source,
@@ -2631,11 +3517,19 @@ def summary_payload(
         "by_skill_invocation": tool_rollup(
             skill_events, ("source_tool", "skill_name", "skill_source", "plugin_name", "invocation_type")
         ),
+        "by_agent": agent_rollup(agent_events, ("source_tool", "agent_name", "agent_type")),
+        "by_agent_invocation": agent_rollup(agent_events, ("source_tool", "agent_name", "agent_type", "invocation_type")),
+        "by_app": app_usage_rollup(app_usage_events, ("app_type",)),
+        "by_app_provider": app_usage_rollup(app_usage_events, ("app_type", "provider_name", "provider_type")),
+        "by_app_model": app_usage_rollup(app_usage_events, ("app_type", "provider_name", "provider_type", "model")),
+        "by_app_day": app_usage_rollup(app_usage_events, ("date", "app_type")),
         "has_price_config": bool(prices),
     }
     if include_events:
         payload["tool_events"] = [event.as_dict() for event in tool_events]
         payload["skill_events"] = [event.as_dict() for event in skill_events]
+        payload["agent_events"] = [event.as_dict() for event in agent_events]
+        payload["app_usage_events"] = [event.as_dict() for event in app_usage_events]
         payload["events"] = [event.as_dict() for event in events]
     return payload
 
@@ -2646,9 +3540,11 @@ def output_json(
     source: str,
     tool_events: list[ToolCallEvent] | None = None,
     skill_events: list[SkillInvocationEvent] | None = None,
+    agent_events: list[AgentInvocationEvent] | None = None,
+    app_usage_events: list[AppUsageEvent] | None = None,
     custom_sources: list[dict[str, Any]] | None = None,
 ) -> None:
-    payload = summary_payload(events, prices, source, tool_events, skill_events, custom_sources)
+    payload = summary_payload(events, prices, source, tool_events, skill_events, agent_events, app_usage_events, custom_sources)
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
@@ -2962,7 +3858,9 @@ HTML_PAGE = r"""<!doctype html>
     #sessions table,
     #tool-categories table,
     #tool-calls table,
-    #skill-invocations table { min-width: 980px; }
+    #skill-invocations table,
+    #agents table,
+    #agent-invocations table { min-width: 980px; }
     th, td { padding: 10px 12px; border-bottom: 1px solid #eef2f6; text-align: left; vertical-align: top; }
     th { color: var(--muted); font-weight: 750; background: rgba(248, 250, 252, 0.92); position: sticky; top: 0; z-index: 1; }
     tbody tr:hover { background: rgba(37, 99, 235, 0.035); }
@@ -3056,7 +3954,15 @@ HTML_PAGE = r"""<!doctype html>
       <section><h2>能力分类</h2><div id="tool-categories"></div></section>
       <section><h2>Tool 调用分布</h2><div id="tool-calls"></div></section>
     </div>
-    <section><h2>Skill 调用</h2><div id="skill-invocations"></div></section>
+      <section><h2>Skill 调用</h2><div id="skill-invocations"></div></section>
+    <div class="wide-grid">
+      <section><h2>应用 Token 消耗</h2><div id="apps"></div></section>
+      <section><h2>应用 / Provider / 模型</h2><div id="app-models"></div></section>
+    </div>
+    <div class="wide-grid">
+      <section><h2>Agent / Subagent 分布</h2><div id="agents"></div></section>
+      <section><h2>Agent / Subagent 调用明细</h2><div id="agent-invocations"></div></section>
+    </div>
   </main>
   <div class="hover-tooltip" id="hover-tooltip" hidden></div>
   <script>
@@ -3413,6 +4319,10 @@ HTML_PAGE = r"""<!doctype html>
       document.getElementById('tool-categories').innerHTML = '<div class="notice">工具明细后台加载中...</div>';
       document.getElementById('tool-calls').innerHTML = '<div class="notice">Tool 调用后台加载中...</div>';
       document.getElementById('skill-invocations').innerHTML = '<div class="notice">Skill 调用后台加载中...</div>';
+      document.getElementById('apps').innerHTML = '<div class="notice">应用消耗后台加载中...</div>';
+      document.getElementById('app-models').innerHTML = '<div class="notice">应用模型明细后台加载中...</div>';
+      document.getElementById('agents').innerHTML = '<div class="notice">Agent / Subagent 统计后台加载中...</div>';
+      document.getElementById('agent-invocations').innerHTML = '<div class="notice">Agent / Subagent 明细后台加载中...</div>';
     }
 
     function renderDetails(data) {
@@ -3424,6 +4334,18 @@ HTML_PAGE = r"""<!doctype html>
       ]);
       renderTable('skill-invocations', data.by_skill_invocation || [], [
         ['source_tool', '来源'], ['skill_name', 'Skill'], ['skill_source', '来源类型'], ['plugin_name', '插件'], ['invocation_type', '调用类型'], ['calls', '调用', 'num'], ['api_requests', 'API 请求', 'num'], ['sessions', '关联会话数', 'num']
+      ]);
+      renderTable('apps', data.by_app_provider || data.by_app || [], [
+        ['app_type', '应用'], ['provider_name', 'Provider'], ['provider_type', '类型'], ['api_requests', 'API 请求', 'num'], ['success_rate', '成功率 %', 'num'], ['total_tokens', '总量', 'num'], ['input_tokens', '输入', 'num'], ['cached_input_tokens', '缓存', 'num'], ['output_tokens', '输出', 'num'], ['cost_usd', '费用', 'num']
+      ]);
+      renderTable('app-models', data.by_app_model || [], [
+        ['app_type', '应用'], ['provider_name', 'Provider'], ['model', '模型'], ['api_requests', 'API 请求', 'num'], ['success_rate', '成功率 %', 'num'], ['avg_latency_ms', '平均延迟 ms', 'num'], ['total_tokens', '总量', 'num'], ['cost_usd', '费用', 'num']
+      ]);
+      renderTable('agents', data.by_agent || [], [
+        ['source_tool', '来源'], ['agent_name', 'Agent/Subagent'], ['agent_type', '类型'], ['calls', '调用', 'num'], ['api_requests', 'API 请求', 'num'], ['sessions', '会话', 'num'], ['total_tokens', '总量', 'num'], ['input_tokens', '输入', 'num'], ['output_tokens', '输出', 'num']
+      ]);
+      renderTable('agent-invocations', data.by_agent_invocation || [], [
+        ['source_tool', '来源'], ['agent_name', 'Agent/Subagent'], ['agent_type', '类型'], ['invocation_type', '调用方式'], ['calls', '调用', 'num'], ['api_requests', 'API 请求', 'num'], ['sessions', '会话', 'num'], ['total_tokens', '总量', 'num']
       ]);
     }
 
@@ -3441,6 +4363,10 @@ HTML_PAGE = r"""<!doctype html>
         document.getElementById('tool-categories').innerHTML = `<div class="notice">工具明细加载失败：${escapeHtml(error.message || String(error))}</div>`;
         document.getElementById('tool-calls').innerHTML = '<div class="notice">Tool 调用加载失败</div>';
         document.getElementById('skill-invocations').innerHTML = '<div class="notice">Skill 调用加载失败</div>';
+        document.getElementById('apps').innerHTML = '<div class="notice">应用消耗加载失败</div>';
+        document.getElementById('app-models').innerHTML = '<div class="notice">应用模型明细加载失败</div>';
+        document.getElementById('agents').innerHTML = '<div class="notice">Agent / Subagent 统计加载失败</div>';
+        document.getElementById('agent-invocations').innerHTML = '<div class="notice">Agent / Subagent 明细加载失败</div>';
       }
     }
 
@@ -3494,6 +4420,7 @@ def serve_dashboard(
     opencode_paths: list[Path],
     claude_paths: list[Path],
     hermes_paths: list[Path],
+    ccswitch_paths: list[Path],
     local_tz: ZoneInfo,
     default_days: int | None,
     default_since: str | None,
@@ -3566,10 +4493,16 @@ def serve_dashboard(
                     tool_events = filter_tool_events(tool_events, days, since, until)
                     skill_events = load_skill_events(source, claude_paths, hermes_paths, local_tz, (event.cwd for event in events), since, until)
                     skill_events = filter_skill_events(skill_events, days, since, until)
+                    agent_events = load_agent_events(source, codex_paths, opencode_paths, claude_paths, hermes_paths, local_tz, since, until)
+                    agent_events = filter_agent_events(agent_events, days, since, until)
+                    app_usage_events = filter_ccswitch_events_by_source(load_ccswitch_app_usage_events(ccswitch_paths, local_tz, since, until), source)
+                    app_usage_events = filter_app_usage_events(app_usage_events, days, since, until)
                 else:
                     tool_events = []
                     skill_events = []
-                payload = summary_payload(events, prices, source, tool_events, skill_events, custom_sources, include_events=False)
+                    agent_events = []
+                    app_usage_events = []
+                payload = summary_payload(events, prices, source, tool_events, skill_events, agent_events, app_usage_events, custom_sources, include_events=False)
                 summary_cache[cache_key] = (now, payload)
                 self.send_json(payload)
                 return
@@ -3623,6 +4556,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Hermes home/profile directory or existing local storage file. Defaults to common per-user locations for macOS/Linux/Windows.",
+    )
+    parser.add_argument(
+        "--ccswitch-path",
+        action="append",
+        type=Path,
+        default=None,
+        help="CC Switch database path or directory. Defaults to ~/.cc-switch/cc-switch.db.",
     )
     parser.add_argument(
         "--source",
@@ -3707,6 +4647,7 @@ def main(argv: list[str] | None = None) -> int:
     opencode_paths = args.opencode_path or settings_paths(settings, "opencode_paths", "opencode_path") or default_opencode_paths()
     claude_paths = args.claude_path or settings_paths(settings, "claude_paths", "claude_path") or default_claude_paths()
     hermes_paths = args.hermes_path or settings_paths(settings, "hermes_paths", "hermes_path") or default_hermes_paths()
+    ccswitch_paths = args.ccswitch_path or settings_paths(settings, "ccswitch_paths", "ccswitch_path") or default_ccswitch_paths()
     price_config = args.price_config or settings_path(settings, "price_config")
     prices = load_price_config(price_config)
 
@@ -3720,6 +4661,7 @@ def main(argv: list[str] | None = None) -> int:
             opencode_paths,
             claude_paths,
             hermes_paths,
+            ccswitch_paths,
             price_config,
             custom_sources,
         )
@@ -3733,6 +4675,7 @@ def main(argv: list[str] | None = None) -> int:
             opencode_paths,
             claude_paths,
             hermes_paths,
+            ccswitch_paths,
             local_tz,
             args.days,
             args.since,
@@ -3749,13 +4692,17 @@ def main(argv: list[str] | None = None) -> int:
     tool_events = filter_tool_events(tool_events, args.days, args.since, args.until)
     skill_events = load_skill_events(source, claude_paths, hermes_paths, local_tz, (event.cwd for event in events), args.since, args.until)
     skill_events = filter_skill_events(skill_events, args.days, args.since, args.until)
+    agent_events = load_agent_events(source, codex_paths, opencode_paths, claude_paths, hermes_paths, local_tz, args.since, args.until)
+    agent_events = filter_agent_events(agent_events, args.days, args.since, args.until)
+    app_usage_events = filter_ccswitch_events_by_source(load_ccswitch_app_usage_events(ccswitch_paths, local_tz, args.since, args.until), source)
+    app_usage_events = filter_app_usage_events(app_usage_events, args.days, args.since, args.until)
 
     if args.format == "json":
-        output_json(events, prices, source, tool_events, skill_events, custom_sources)
+        output_json(events, prices, source, tool_events, skill_events, agent_events, app_usage_events, custom_sources)
     elif args.format == "csv":
         output_csv(events)
     else:
-        output_text(events, prices, tool_events, skill_events)
+        output_text(events, prices, tool_events, skill_events, agent_events, app_usage_events)
     return 0
 
 
